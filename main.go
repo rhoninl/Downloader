@@ -36,6 +36,12 @@ func main() {
 
 //New 初始化下载器
 func New(url string, numThreads int) *HttpDownloader {
+	prot := strings.Split(url, "://")
+	if prot[0] == "https" {
+		fmt.Println("检测到https协议，为防止出错，自动将https转换成http:")
+		url = strings.Replace(url, "https", "http", 1)
+		fmt.Println(url)
+	}
 	var urlSplits []string = strings.Split(url, "/")
 	var filename string = urlSplits[len(urlSplits)-1]
 	res, err := http.Head(url)
