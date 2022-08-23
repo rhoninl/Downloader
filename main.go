@@ -29,6 +29,7 @@ type HttpDownloader struct {
 	currentSize   int
 	file          *os.File
 	start         time.Time
+	locker        *sync.Mutex
 	Bitmap
 }
 
@@ -71,7 +72,7 @@ func New(url string, numThreads int) *HttpDownloader {
 		acceptRanges:  len(res.Header["Accept-Ranges"]) != 0 && res.Header["Accept-Ranges"][0] == "bytes",
 	}
 
-	file, err := os.Open(downloader.filename + ".dld")
+	file, err := os.OpenFile(downloader.filename+".dld", os.O_RDWR, 0644)
 	if err != nil {
 		file, err = os.Create(downloader.filename + ".dld")
 		if err != nil {
@@ -79,10 +80,11 @@ func New(url string, numThreads int) *HttpDownloader {
 			panic(err)
 		}
 	}
-
 	downloader.file = file
 	downloader.readBitMap()
 	downloader.currentSize = downloader.contentLength - len(downloader.split)*blockSize
+
+	downloader.locker = &sync.Mutex{}
 	return downloader
 }
 
@@ -143,12 +145,14 @@ func (downloader *HttpDownloader) SplitDownload(start, end int) {
 		log.Panicln(err)
 	}
 
-	SaveFile(downloader.file, int64(start), resp)
-	downloader.currentSize += blockSize
+	downloader.SaveFile(downloader.file, int64(start), resp)
 	downloader.setBitMap(start)
+	downloader.currentSize += blockSize
 }
 
-func SaveFile(file *os.File, offset int64, resp *http.Response) {
+func (downloader *HttpDownloader) SaveFile(file *os.File, offset int64, resp *http.Response) {
+	downloader.locker.Lock()
+	defer downloader.locker.Unlock()
 	file.Seek(offset, 0)
 
 	content, err := io.ReadAll(resp.Body)
@@ -156,9 +160,9 @@ func SaveFile(file *os.File, offset int64, resp *http.Response) {
 		fmt.Println("error when write bytes to file, error: ", err)
 		panic(err)
 	}
-
 	defer resp.Body.Close()
 	file.Write(content)
+	file.Sync()
 }
 
 //Split 将下载文件分段
@@ -170,10 +174,10 @@ func (downloader *HttpDownloader) Split() {
 	var start, end int
 	for i := 0; i < count-1; i++ {
 		start = i * blockSize
-		end = (i+1)*blockSize - 1
-		result <- []int{start, end}
+		end = (i + 1) * blockSize
+		result <- []int{start, end - 1}
 	}
-	result <- []int{end + 1, end + blockSizeFin}
+	result <- []int{end, end + blockSizeFin}
 	downloader.split = result
 }
 
