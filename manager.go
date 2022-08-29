@@ -16,7 +16,6 @@ import (
 type manager struct {
 	urlInfo
 
-	autoAdapt              bool
 	blockSize              int
 	chanBufferSize         int
 	fileWorkerGoRuntineNum int
@@ -91,7 +90,6 @@ func (manager *manager) Run() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if manager.allowSplit {
-		log.Println("splite")
 		manager.spliteDownload(ctx)
 	} else {
 		fmt.Println("downloading ...  // case single download there were not any schedule")
@@ -290,6 +288,7 @@ func (manager *manager) progressBar(ctx context.Context) {
 func (manager *manager) newSecretary(ctx context.Context, callbackChan <-chan int) {
 	defer func() {
 		manager.dropBitMap()
+		manager.file.Close()
 		manager.wg.Done()
 	}()
 	for {
