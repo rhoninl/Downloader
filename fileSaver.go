@@ -31,6 +31,7 @@ func newSaver(ctx context.Context, filename string, data <-chan saveData, callBa
 }
 
 func (saver *saver) saveFile(ctx context.Context, data <-chan saveData, callBack chan<- int) {
+	defer saver.file.Close()
 	for {
 		select {
 		case info := <-data:
