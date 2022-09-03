@@ -13,6 +13,7 @@ type downloader struct {
 	url string
 }
 
+// test
 func newDownloaderSingle(ctx context.Context, url string, filename string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
