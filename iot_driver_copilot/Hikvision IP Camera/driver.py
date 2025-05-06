@@ -1,255 +1,138 @@
 import os
-import threading
-import queue
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
-import base64
-import requests
-import socket
+import asyncio
+from fastapi import FastAPI, Response, Request, BackgroundTasks, status
+from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
+from threading import Lock
 
-# Required environment variables:
-# CAMERA_IP: Camera IP address
-# CAMERA_RTSP_PORT: Camera RTSP port (default 554)
-# CAMERA_HTTP_PORT: Camera HTTP port (for snapshot, default 80)
-# CAMERA_USERNAME: Camera username
-# CAMERA_PASSWORD: Camera password
-# SERVER_HOST: HTTP server host (default "0.0.0.0")
-# SERVER_PORT: HTTP server port (default 8080)
-# STREAM_PATH: RTSP stream path (default "/Streaming/Channels/101")
+import av
+import cv2
+import numpy as np
 
-CAMERA_IP = os.environ.get("CAMERA_IP")
-CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", "554"))
-CAMERA_HTTP_PORT = int(os.environ.get("CAMERA_HTTP_PORT", "80"))
-CAMERA_USERNAME = os.environ.get("CAMERA_USERNAME", "admin")
-CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD", "")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-STREAM_PATH = os.environ.get("STREAM_PATH", "/Streaming/Channels/101")
+# Environment Variables
+DEVICE_IP = os.getenv('DEVICE_IP', '192.168.1.64')
+RTSP_PORT = int(os.getenv('DEVICE_RTSP_PORT', 554))
+USERNAME = os.getenv('DEVICE_USERNAME', 'admin')
+PASSWORD = os.getenv('DEVICE_PASSWORD', '12345')
+RTSP_PATH = os.getenv('DEVICE_RTSP_PATH', 'Streaming/Channels/101')
+HTTP_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
+HTTP_PORT = int(os.getenv('SERVER_PORT', 8000))
 
-RTSP_URL = f"rtsp://{CAMERA_USERNAME}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}{STREAM_PATH}"
+RTSP_URL = f"rtsp://{USERNAME}:{PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
-SNAPSHOT_URL = f"http://{CAMERA_IP}:{CAMERA_HTTP_PORT}/ISAPI/Streaming/channels/101/picture"
+SNAPSHOT_PATH = os.getenv('DEVICE_SNAPSHOT_PATH', 'Streaming/channels/1/picture')
+SNAPSHOT_URL = f"http://{DEVICE_IP}/ISAPI/{SNAPSHOT_PATH}"
 
-STREAM_CLIENTS = {}
-STREAM_THREAD = None
-STREAM_QUEUE = queue.Queue(maxsize=100)
-STREAM_RUNNING = threading.Event()
+# Video stream session management
+class StreamSessionManager:
+    def __init__(self):
+        self.lock = Lock()
+        self.active = False
+        self.container = None
+        self.stop_flag = False
 
+    def start(self):
+        with self.lock:
+            if not self.active:
+                self.stop_flag = False
+                self.container = av.open(RTSP_URL)
+                self.active = True
 
-def get_auth_header():
-    userpass = f"{CAMERA_USERNAME}:{CAMERA_PASSWORD}"
-    b64 = base64.b64encode(userpass.encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {b64}"}
+    def stop(self):
+        with self.lock:
+            self.stop_flag = True
+            if self.container is not None:
+                self.container.close()
+                self.container = None
+            self.active = False
 
+    def get_container(self):
+        with self.lock:
+            return self.container
 
-def open_rtsp_stream():
-    # Minimal RTSP-over-TCP client for H.264 proxying
-    # This implementation is basic and supports only Hikvision's simple RTSP stream
-    import re
+    def should_stop(self):
+        with self.lock:
+            return self.stop_flag
 
-    # Connect to camera RTSP server
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10)
-    sock.connect((CAMERA_IP, CAMERA_RTSP_PORT))
-    cseq = 1
+stream_manager = StreamSessionManager()
+app = FastAPI()
+last_stream_task = None
 
-    def send(cmd):
-        nonlocal cseq
-        sock.sendall(cmd.encode("utf-8"))
-        cseq += 1
-
-    def recv():
-        data = b""
-        while True:
-            part = sock.recv(4096)
-            data += part
-            if b"\r\n\r\n" in data:
-                break
-        return data.decode("utf-8", errors="ignore")
-
-    session = None
-
-    # RTSP DESCRIBE
-    describe = (
-        f'DESCRIBE {RTSP_URL} RTSP/1.0\r\n'
-        f'CSeq: {cseq}\r\n'
-        f'Authorization: Basic {base64.b64encode(f"{CAMERA_USERNAME}:{CAMERA_PASSWORD}".encode()).decode()}\r\n'
-        'Accept: application/sdp\r\n'
-        '\r\n'
-    )
-    send(describe)
-    describe_resp = recv()
-    if "401 Unauthorized" in describe_resp:
-        sock.close()
-        raise Exception("RTSP Unauthorized")
-    m = re.search(r'Session: ([^\r\n]+)', describe_resp)
-    if m:
-        session = m.group(1).split(';')[0].strip()
-
-    # RTSP SETUP (TCP interleaved)
-    setup = (
-        f'SETUP {RTSP_URL}/trackID=1 RTSP/1.0\r\n'
-        f'CSeq: {cseq}\r\n'
-        f'Authorization: Basic {base64.b64encode(f"{CAMERA_USERNAME}:{CAMERA_PASSWORD}".encode()).decode()}\r\n'
-        'Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n'
-        f'Session: {session}\r\n' if session else ''
-    )
-    send(setup)
-    setup_resp = recv()
-    m = re.search(r'Session: ([^\r\n]+)', setup_resp)
-    if m:
-        session = m.group(1).split(';')[0].strip()
-
-    # RTSP PLAY
-    play = (
-        f'PLAY {RTSP_URL} RTSP/1.0\r\n'
-        f'CSeq: {cseq}\r\n'
-        f'Authorization: Basic {base64.b64encode(f"{CAMERA_USERNAME}:{CAMERA_PASSWORD}".encode()).decode()}\r\n'
-        f'Session: {session}\r\n'
-        '\r\n'
-    )
-    send(play)
-    play_resp = recv()
-    if "200 OK" not in play_resp:
-        sock.close()
-        raise Exception("RTSP PLAY failed")
-
-    # Start reading RTP packets (RTP/RTSP over TCP: $xx size data)
-    try:
-        while STREAM_RUNNING.is_set():
-            hdr = sock.recv(4)
-            if not hdr or hdr[0] != 0x24:
-                continue
-            channel = hdr[1]
-            size = (hdr[2] << 8) | hdr[3]
-            payload = b''
-            while len(payload) < size:
-                chunk = sock.recv(size - len(payload))
-                if not chunk:
-                    break
-                payload += chunk
-            if channel == 0:  # Video channel
-                try:
-                    STREAM_QUEUE.put(payload, timeout=1)
-                except queue.Full:
-                    pass
-    finally:
-        sock.close()
-
-
-def stream_worker():
-    while STREAM_RUNNING.is_set():
+@app.get("/video/stream")
+async def video_stream():
+    """
+    Open and retrieve a live H.264 video feed from the camera.
+    The response is a multipart MJPEG stream consumable in browsers and by ffmpeg/curl.
+    """
+    async def mjpeg_generator():
         try:
-            if not STREAM_CLIENTS:
-                time.sleep(0.5)
-                continue
-            open_rtsp_stream()
-        except Exception as e:
-            time.sleep(2)
-
-
-class CameraHandler(BaseHTTPRequestHandler):
-    server_version = "HikvisionHTTPProxy/1.0"
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/video/stream":
-            self.handle_video_stream()
-        elif parsed.path == "/camera/snapshot":
-            self.handle_snapshot()
-        else:
-            self.send_error(404, "Not Found")
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/video/stream/stop":
-            self.handle_stop_stream()
-        else:
-            self.send_error(404, "Not Found")
-
-    def handle_video_stream(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-
-        client_id = id(self)
-        STREAM_CLIENTS[client_id] = self
-        try:
-            if not STREAM_RUNNING.is_set():
-                STREAM_RUNNING.set()
-                global STREAM_THREAD
-                if STREAM_THREAD is None or not STREAM_THREAD.is_alive():
-                    STREAM_THREAD = threading.Thread(target=stream_worker, daemon=True)
-                    STREAM_THREAD.start()
-
-            while True:
-                try:
-                    pkt = STREAM_QUEUE.get(timeout=5)
-                except queue.Empty:
+            await run_in_threadpool(stream_manager.start)
+            container = await run_in_threadpool(stream_manager.get_container)
+            video_stream = next(s for s in container.streams if s.type == 'video')
+            for packet in container.demux(video_stream):
+                if stream_manager.should_stop():
                     break
-                # RTP payload conversion (H.264 NALUs) to fragmented MP4 is complex; 
-                # for simplicity, just stream raw NALUs as video/mp4 for players like VLC.
-                self.wfile.write(pkt)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+                for frame in packet.decode():
+                    img = frame.to_ndarray(format='bgr24')
+                    ret, jpeg = cv2.imencode('.jpg', img)
+                    if not ret:
+                        continue
+                    yield (
+                        b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n\r\n' +
+                        jpeg.tobytes() +
+                        b'\r\n'
+                    )
         finally:
-            STREAM_CLIENTS.pop(client_id, None)
-            if not STREAM_CLIENTS:
-                STREAM_RUNNING.clear()
-                while not STREAM_QUEUE.empty():
-                    try:
-                        STREAM_QUEUE.get_nowait()
-                    except queue.Empty:
-                        break
+            await run_in_threadpool(stream_manager.stop)
 
-    def handle_snapshot(self):
-        try:
-            resp = requests.get(SNAPSHOT_URL, headers=get_auth_header(), timeout=5, stream=True)
-            if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith("image/jpeg"):
-                self.send_response(200)
-                self.send_header("Content-Type", resp.headers["Content-Type"])
-                self.send_header("Content-Length", resp.headers.get("Content-Length", ""))
-                self.end_headers()
-                for chunk in resp.iter_content(4096):
-                    self.wfile.write(chunk)
-            else:
-                self.send_error(502, "Camera did not return JPEG")
-        except Exception:
-            self.send_error(504, "Camera snapshot timeout")
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
+    }
+    return StreamingResponse(mjpeg_generator(), headers=headers)
 
-    def handle_stop_stream(self):
-        client_id = id(self)
-        STREAM_CLIENTS.pop(client_id, None)
-        if not STREAM_CLIENTS:
-            STREAM_RUNNING.clear()
-            while not STREAM_QUEUE.empty():
-                try:
-                    STREAM_QUEUE.get_nowait()
-                except queue.Empty:
-                    break
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"status":"stopped"}')
+@app.post("/video/stream/stop")
+async def stop_video_stream():
+    """
+    Stop the ongoing live video stream and release camera resources.
+    """
+    await run_in_threadpool(stream_manager.stop)
+    return JSONResponse({"status": "stopped"}, status_code=status.HTTP_200_OK)
 
-    def log_message(self, format, *args):
-        pass  # Suppress default logging
-
-
-def run():
-    httpd = HTTPServer((SERVER_HOST, SERVER_PORT), CameraHandler)
-    print(f"Serving Hikvision Camera HTTP Proxy on {SERVER_HOST}:{SERVER_PORT}")
+@app.get("/camera/snapshot")
+async def camera_snapshot():
+    """
+    Capture a single JPEG image from the camera’s current view.
+    """
+    # Try RTSP first, fallback to ISAPI HTTP snapshot if enabled
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
+        container = av.open(RTSP_URL)
+        stream = next(s for s in container.streams if s.type == 'video')
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                img = frame.to_ndarray(format='bgr24')
+                ret, jpeg = cv2.imencode('.jpg', img)
+                container.close()
+                if ret:
+                    return Response(jpeg.tobytes(), media_type="image/jpeg")
+                break
+        container.close()
+    except Exception:
         pass
-    finally:
-        httpd.server_close()
 
+    # Optionally: try HTTP snapshot API of Hikvision (requires snapshot enabled and credentials)
+    try:
+        import requests
+        resp = requests.get(SNAPSHOT_URL, auth=(USERNAME, PASSWORD), timeout=5)
+        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image/jpeg'):
+            return Response(resp.content, media_type="image/jpeg")
+    except Exception:
+        pass
+
+    return JSONResponse({"error": "Could not retrieve snapshot"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 if __name__ == "__main__":
-    run()
+    import uvicorn
+    uvicorn.run("main:app", host=HTTP_HOST, port=HTTP_PORT)
