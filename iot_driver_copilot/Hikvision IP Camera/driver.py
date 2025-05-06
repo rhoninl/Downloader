@@ -1,138 +1,107 @@
 import os
-import asyncio
-from fastapi import FastAPI, Response, Request, BackgroundTasks, status
-from fastapi.responses import StreamingResponse, JSONResponse
-from starlette.concurrency import run_in_threadpool
-from threading import Lock
-
-import av
+import threading
+import io
+import time
+from flask import Flask, Response, stream_with_context, request, jsonify
 import cv2
 import numpy as np
 
-# Environment Variables
-DEVICE_IP = os.getenv('DEVICE_IP', '192.168.1.64')
-RTSP_PORT = int(os.getenv('DEVICE_RTSP_PORT', 554))
-USERNAME = os.getenv('DEVICE_USERNAME', 'admin')
-PASSWORD = os.getenv('DEVICE_PASSWORD', '12345')
-RTSP_PATH = os.getenv('DEVICE_RTSP_PATH', 'Streaming/Channels/101')
-HTTP_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
-HTTP_PORT = int(os.getenv('SERVER_PORT', 8000))
+# Environment variables for configuration
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
+DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", 554))
+DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
+DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "12345")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", 8080))
+RTSP_PATH = os.environ.get("DEVICE_RTSP_PATH", "Streaming/Channels/101")
+SNAPSHOT_PATH = os.environ.get("DEVICE_SNAPSHOT_PATH", "Streaming/channels/101/picture")
 
-RTSP_URL = f"rtsp://{USERNAME}:{PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+# RTSP url for main stream (H.264)
+RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{RTSP_PATH}"
 
-SNAPSHOT_PATH = os.getenv('DEVICE_SNAPSHOT_PATH', 'Streaming/channels/1/picture')
+# HTTP snapshot url (Hikvision HTTP snapshot API)
 SNAPSHOT_URL = f"http://{DEVICE_IP}/ISAPI/{SNAPSHOT_PATH}"
 
-# Video stream session management
-class StreamSessionManager:
-    def __init__(self):
-        self.lock = Lock()
-        self.active = False
-        self.container = None
-        self.stop_flag = False
+app = Flask(__name__)
 
-    def start(self):
-        with self.lock:
-            if not self.active:
-                self.stop_flag = False
-                self.container = av.open(RTSP_URL)
-                self.active = True
+# Control flag for stopping stream
+streaming_sessions = {}
 
-    def stop(self):
-        with self.lock:
-            self.stop_flag = True
-            if self.container is not None:
-                self.container.close()
-                self.container = None
-            self.active = False
+def gen_video_stream(session_id):
+    cap = cv2.VideoCapture(RTSP_URL)
+    if not cap.isOpened():
+        yield b''
+        return
 
-    def get_container(self):
-        with self.lock:
-            return self.container
+    boundary = "frame"
+    try:
+        while streaming_sessions.get(session_id, True):
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+            # Encode frame as JPEG
+            ret2, jpeg = cv2.imencode('.jpg', frame)
+            if not ret2:
+                continue
+            frame_bytes = jpeg.tobytes()
+            yield (
+                b'--' + boundary.encode() + b'\r\n'
+                b'Content-Type: image/jpeg\r\n'
+                b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n'
+                b'\r\n' + frame_bytes + b'\r\n'
+            )
+            time.sleep(0.04)  # ~25fps
+    finally:
+        cap.release()
+        streaming_sessions.pop(session_id, None)
 
-    def should_stop(self):
-        with self.lock:
-            return self.stop_flag
-
-stream_manager = StreamSessionManager()
-app = FastAPI()
-last_stream_task = None
-
-@app.get("/video/stream")
-async def video_stream():
-    """
-    Open and retrieve a live H.264 video feed from the camera.
-    The response is a multipart MJPEG stream consumable in browsers and by ffmpeg/curl.
-    """
-    async def mjpeg_generator():
-        try:
-            await run_in_threadpool(stream_manager.start)
-            container = await run_in_threadpool(stream_manager.get_container)
-            video_stream = next(s for s in container.streams if s.type == 'video')
-            for packet in container.demux(video_stream):
-                if stream_manager.should_stop():
-                    break
-                for frame in packet.decode():
-                    img = frame.to_ndarray(format='bgr24')
-                    ret, jpeg = cv2.imencode('.jpg', img)
-                    if not ret:
-                        continue
-                    yield (
-                        b'--frame\r\n'
-                        b'Content-Type: image/jpeg\r\n\r\n' +
-                        jpeg.tobytes() +
-                        b'\r\n'
-                    )
-        finally:
-            await run_in_threadpool(stream_manager.stop)
-
+@app.route('/video/stream', methods=['GET'])
+def video_stream():
+    # Start a new streaming session
+    session_id = str(time.time()) + str(np.random.randint(0, 10000))
+    streaming_sessions[session_id] = True
+    boundary = "frame"
     headers = {
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
+        'Content-Type': f'multipart/x-mixed-replace; boundary={boundary}'
     }
-    return StreamingResponse(mjpeg_generator(), headers=headers)
+    return Response(stream_with_context(gen_video_stream(session_id)), headers=headers)
 
-@app.post("/video/stream/stop")
-async def stop_video_stream():
-    """
-    Stop the ongoing live video stream and release camera resources.
-    """
-    await run_in_threadpool(stream_manager.stop)
-    return JSONResponse({"status": "stopped"}, status_code=status.HTTP_200_OK)
-
-@app.get("/camera/snapshot")
-async def camera_snapshot():
-    """
-    Capture a single JPEG image from the camera’s current view.
-    """
-    # Try RTSP first, fallback to ISAPI HTTP snapshot if enabled
+@app.route('/camera/snapshot', methods=['GET'])
+def camera_snapshot():
+    # Try to get snapshot via HTTP API if available
+    import requests
     try:
-        container = av.open(RTSP_URL)
-        stream = next(s for s in container.streams if s.type == 'video')
-        for packet in container.demux(stream):
-            for frame in packet.decode():
-                img = frame.to_ndarray(format='bgr24')
-                ret, jpeg = cv2.imencode('.jpg', img)
-                container.close()
-                if ret:
-                    return Response(jpeg.tobytes(), media_type="image/jpeg")
-                break
-        container.close()
+        resp = requests.get(
+            SNAPSHOT_URL,
+            auth=(DEVICE_USERNAME, DEVICE_PASSWORD),
+            timeout=4,
+            stream=True
+        )
+        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image'):
+            return Response(resp.content, mimetype='image/jpeg')
     except Exception:
         pass
 
-    # Optionally: try HTTP snapshot API of Hikvision (requires snapshot enabled and credentials)
-    try:
-        import requests
-        resp = requests.get(SNAPSHOT_URL, auth=(USERNAME, PASSWORD), timeout=5)
-        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image/jpeg'):
-            return Response(resp.content, media_type="image/jpeg")
-    except Exception:
-        pass
+    # Fallback: capture one frame from RTSP
+    cap = cv2.VideoCapture(RTSP_URL)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        return Response("Failed to capture snapshot", status=500)
+    ret2, jpeg = cv2.imencode('.jpg', frame)
+    if not ret2:
+        return Response("Failed to encode snapshot", status=500)
+    return Response(jpeg.tobytes(), mimetype='image/jpeg')
 
-    return JSONResponse({"error": "Could not retrieve snapshot"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+@app.route('/video/stream/stop', methods=['POST'])
+def stop_stream():
+    # Stop all active streams
+    stopped = 0
+    for k in list(streaming_sessions.keys()):
+        streaming_sessions[k] = False
+        stopped += 1
+    return jsonify({"message": f"Stopped {stopped} stream(s)"}), 200
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == '__main__':
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
