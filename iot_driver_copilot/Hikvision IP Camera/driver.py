@@ -1,125 +1,185 @@
 import os
-import asyncio
-import aiohttp
-from aiohttp import web
+import threading
+import queue
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 import base64
-
+import requests
 import cv2
-import av
+import numpy as np
 
-# Environment configuration
-DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
-DEVICE_USER = os.environ.get('DEVICE_USER', 'admin')
-DEVICE_PASS = os.environ.get('DEVICE_PASS', '12345')
+# Configuration from environment variables
+CAMERA_IP = os.environ.get('CAMERA_IP')
+CAMERA_RTSP_PORT = int(os.environ.get('CAMERA_RTSP_PORT', '554'))
+CAMERA_USERNAME = os.environ.get('CAMERA_USERNAME')
+CAMERA_PASSWORD = os.environ.get('CAMERA_PASSWORD')
+CAMERA_HTTP_PORT = int(os.environ.get('CAMERA_HTTP_PORT', '80'))
+
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8080))
-RTSP_PORT = os.environ.get('RTSP_PORT', '554')
-SNAPSHOT_PORT = os.environ.get('SNAPSHOT_PORT', '80')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-RTSP_PATH = os.environ.get('RTSP_PATH', '/Streaming/Channels/101')
-SNAPSHOT_PATH = os.environ.get('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
+RTSP_PATH = os.environ.get('CAMERA_RTSP_PATH', '/Streaming/Channels/101')
+# Default RTSP url: rtsp://user:pass@ip:port/path
 
-VIDEO_STREAM_ROUTE = '/video/stream'
-VIDEO_STREAM_STOP_ROUTE = '/video/stream/stop'
-SNAPSHOT_ROUTE = '/camera/snapshot'
+SNAPSHOT_PATH = os.environ.get('CAMERA_SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
 
-# Shared state for stream control
-streams = {}
+STREAM_FPS = int(os.environ.get('STREAM_FPS', '15'))
 
-# Helper: RTSP URL builder
+# Global stream state
+streaming_clients = set()
+stream_queue = queue.Queue(maxsize=10)
+streaming_active = threading.Event()
+video_thread = None
+video_thread_lock = threading.Lock()
+
 def get_rtsp_url():
-    return f'rtsp://{DEVICE_USER}:{DEVICE_PASS}@{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}'
+    user_pass = ''
+    if CAMERA_USERNAME and CAMERA_PASSWORD:
+        user_pass = f'{CAMERA_USERNAME}:{CAMERA_PASSWORD}@'
+    return f'rtsp://{user_pass}{CAMERA_IP}:{CAMERA_RTSP_PORT}{RTSP_PATH}'
 
-# Helper: Snapshot URL builder
 def get_snapshot_url():
-    return f'http://{DEVICE_IP}:{SNAPSHOT_PORT}{SNAPSHOT_PATH}'
+    return f'http://{CAMERA_IP}:{CAMERA_HTTP_PORT}{SNAPSHOT_PATH}'
 
-# Video Streaming Handler
-async def video_stream(request):
-    """
-    Streams H.264 video as MJPEG over HTTP for browser compatibility.
-    """
-    boundary = "frame"
-    response = web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={
-            'Content-Type': f'multipart/x-mixed-replace; boundary=--{boundary}',
-            'Cache-Control': 'no-cache',
-            'Connection': 'close',
-            'Pragma': 'no-cache'
-        }
-    )
-    await response.prepare(request)
+def fetch_snapshot():
+    url = get_snapshot_url()
+    auth = (CAMERA_USERNAME, CAMERA_PASSWORD) if (CAMERA_USERNAME and CAMERA_PASSWORD) else None
+    resp = requests.get(url, auth=auth, timeout=10)
+    resp.raise_for_status()
+    return resp.content
 
-    session_id = id(request)
-    streams[session_id] = True
-
+def video_capture_worker():
     rtsp_url = get_rtsp_url()
-    container = None
+    cap = cv2.VideoCapture(rtsp_url)
+    if not cap.isOpened():
+        streaming_active.clear()
+        return
+    last_frame_time = 0
     try:
-        container = av.open(rtsp_url)
-        video_stream = next(s for s in container.streams if s.type == 'video')
-
-        for frame in container.decode(video_stream):
-            if not streams.get(session_id):
+        while streaming_active.is_set():
+            ret, frame = cap.read()
+            if not ret:
                 break
-            img = frame.to_ndarray(format='bgr24')
-            ret, jpeg = cv2.imencode('.jpg', img)
+            now = time.time()
+            if STREAM_FPS > 0 and now - last_frame_time < 1.0 / STREAM_FPS:
+                time.sleep(max(0, (1.0 / STREAM_FPS) - (now - last_frame_time)))
+                continue
+            last_frame_time = now
+            ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
-            data = jpeg.tobytes()
-            await response.write(
-                f"--{boundary}\r\n".encode() +
-                b"Content-Type: image/jpeg\r\n" +
-                f"Content-Length: {len(data)}\r\n\r\n".encode() +
-                data + b"\r\n"
-            )
-            await asyncio.sleep(0.04)  # ~25fps
-    except Exception:
+            try:
+                stream_queue.put(jpeg.tobytes(), block=False)
+            except queue.Full:
+                pass  # drop frame if queue is full
+    finally:
+        cap.release()
+        streaming_active.clear()
+        with stream_queue.mutex:
+            stream_queue.queue.clear()
+
+def start_video_stream():
+    global video_thread
+    with video_thread_lock:
+        if video_thread is None or not video_thread.is_alive():
+            streaming_active.set()
+            video_thread = threading.Thread(target=video_capture_worker, daemon=True)
+            video_thread.start()
+
+def stop_video_stream():
+    streaming_active.clear()
+    with video_thread_lock:
+        if video_thread is not None:
+            video_thread.join(timeout=1)
+    with stream_queue.mutex:
+        stream_queue.queue.clear()
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+class HikvisionHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/video/stream':
+            self.handle_video_stream()
+        elif self.path == '/camera/snapshot':
+            self.handle_snapshot()
+        else:
+            self.send_error(404, 'Not Found')
+
+    def do_POST(self):
+        if self.path == '/video/stream/stop':
+            self.handle_stream_stop()
+        else:
+            self.send_error(404, 'Not Found')
+
+    def handle_video_stream(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+        self.end_headers()
+        client_id = id(self)
+        streaming_clients.add(client_id)
+        try:
+            start_video_stream()
+            while streaming_active.is_set():
+                try:
+                    frame = stream_queue.get(timeout=5)
+                except queue.Empty:
+                    continue
+                self.wfile.write(b'--frame\r\n')
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(frame)))
+                self.end_headers()
+                self.wfile.write(frame)
+                self.wfile.write(b'\r\n')
+                if not self.is_client_connected():
+                    break
+        except Exception:
+            pass
+        finally:
+            streaming_clients.discard(client_id)
+            if not streaming_clients:
+                stop_video_stream()
+
+    def handle_snapshot(self):
+        try:
+            img_bytes = fetch_snapshot()
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', str(len(img_bytes)))
+            self.end_headers()
+            self.wfile.write(img_bytes)
+        except Exception as e:
+            self.send_error(500, f'Failed to fetch snapshot: {str(e)}')
+
+    def handle_stream_stop(self):
+        streaming_clients.clear()
+        stop_video_stream()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{"status":"stream stopped"}')
+
+    def log_message(self, format, *args):
+        pass
+
+    def is_client_connected(self):
+        try:
+            self.wfile.flush()
+            return True
+        except Exception:
+            return False
+
+def main():
+    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), HikvisionHandler)
+    print(f"Hikvision IP Camera HTTP driver is running at http://{SERVER_HOST}:{SERVER_PORT}/")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
         pass
     finally:
-        if session_id in streams:
-            del streams[session_id]
-        if container is not None:
-            container.close()
-        await response.write_eof()
-    return response
-
-# Stream Stop Handler
-async def video_stream_stop(request):
-    """
-    Stops the ongoing live video stream.
-    """
-    for session in list(streams.keys()):
-        streams[session] = False
-    return web.json_response({"status": "stopped"})
-
-# Snapshot Handler
-async def camera_snapshot(request):
-    """
-    Grabs a JPEG snapshot from the camera.
-    """
-    url = get_snapshot_url()
-    auth = aiohttp.BasicAuth(DEVICE_USER, DEVICE_PASS)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, auth=auth) as resp:
-            if resp.status != 200:
-                return web.Response(status=500, text='Snapshot failed')
-            data = await resp.read()
-            return web.Response(
-                body=data,
-                content_type='image/jpeg',
-                headers={'Cache-Control': 'no-cache'}
-            )
-
-# Application setup
-app = web.Application()
-app.add_routes([
-    web.get(VIDEO_STREAM_ROUTE, video_stream),
-    web.post(VIDEO_STREAM_STOP_ROUTE, video_stream_stop),
-    web.get(SNAPSHOT_ROUTE, camera_snapshot),
-])
+        stop_video_stream()
+        server.server_close()
 
 if __name__ == '__main__':
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    main()
