@@ -2,106 +2,114 @@ import os
 import threading
 import io
 import time
-from flask import Flask, Response, stream_with_context, request, jsonify
+from flask import Flask, Response, request, jsonify, abort
+import requests
 import cv2
 import numpy as np
 
-# Environment variables for configuration
-DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
-DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", 554))
-DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
-DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "12345")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", 8080))
-RTSP_PATH = os.environ.get("DEVICE_RTSP_PATH", "Streaming/Channels/101")
-SNAPSHOT_PATH = os.environ.get("DEVICE_SNAPSHOT_PATH", "Streaming/channels/101/picture")
+# Load configuration from environment variables
+DEVICE_IP = os.environ.get("DEVICE_IP")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+CAMERA_USER = os.environ.get("CAMERA_USER", "admin")
+CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD", "")
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+SNAPSHOT_PATH = os.environ.get("SNAPSHOT_PATH", "/ISAPI/Streaming/channels/101/picture")
 
-# RTSP url for main stream (H.264)
-RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{RTSP_PATH}"
+RTSP_STREAM_PATH = os.environ.get("RTSP_STREAM_PATH", "/Streaming/Channels/101")
 
-# HTTP snapshot url (Hikvision HTTP snapshot API)
-SNAPSHOT_URL = f"http://{DEVICE_IP}/ISAPI/{SNAPSHOT_PATH}"
+# Compose RTSP URL
+RTSP_URL = f"rtsp://{CAMERA_USER}:{CAMERA_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}{RTSP_STREAM_PATH}"
+
+# Compose snapshot URL
+SNAPSHOT_URL = f"http://{DEVICE_IP}{SNAPSHOT_PATH}"
 
 app = Flask(__name__)
 
-# Control flag for stopping stream
-streaming_sessions = {}
+# Stream control
+streaming_flags = {}
+stream_locks = {}
 
-def gen_video_stream(session_id):
+def gen_video_stream(client_id):
+    # Use OpenCV to read RTSP and stream as multipart/x-mixed-replace
     cap = cv2.VideoCapture(RTSP_URL)
     if not cap.isOpened():
-        yield b''
+        yield b"--frame\r\nContent-Type: text/plain\r\n\r\nUnable to open video stream.\r\n"
         return
-
-    boundary = "frame"
+    streaming_flags[client_id] = True
     try:
-        while streaming_sessions.get(session_id, True):
+        while streaming_flags.get(client_id):
             ret, frame = cap.read()
             if not ret:
-                time.sleep(0.1)
                 continue
             # Encode frame as JPEG
-            ret2, jpeg = cv2.imencode('.jpg', frame)
-            if not ret2:
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
                 continue
             frame_bytes = jpeg.tobytes()
-            yield (
-                b'--' + boundary.encode() + b'\r\n'
-                b'Content-Type: image/jpeg\r\n'
-                b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n'
-                b'\r\n' + frame_bytes + b'\r\n'
-            )
-            time.sleep(0.04)  # ~25fps
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            time.sleep(0.04)  # ~25 FPS
     finally:
         cap.release()
-        streaming_sessions.pop(session_id, None)
+        streaming_flags.pop(client_id, None)
 
 @app.route('/video/stream', methods=['GET'])
 def video_stream():
-    # Start a new streaming session
-    session_id = str(time.time()) + str(np.random.randint(0, 10000))
-    streaming_sessions[session_id] = True
-    boundary = "frame"
-    headers = {
-        'Content-Type': f'multipart/x-mixed-replace; boundary={boundary}'
-    }
-    return Response(stream_with_context(gen_video_stream(session_id)), headers=headers)
+    client_id = request.remote_addr + ":" + str(request.environ.get("REMOTE_PORT", ""))
+    if client_id in stream_locks:
+        abort(429, "Already streaming for this client")
+    stream_locks[client_id] = True
+    streaming_flags[client_id] = True
+
+    def stream_with_cleanup():
+        try:
+            for chunk in gen_video_stream(client_id):
+                yield chunk
+        finally:
+            stream_locks.pop(client_id, None)
+            streaming_flags.pop(client_id, None)
+
+    return Response(stream_with_cleanup(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/camera/snapshot', methods=['GET'])
 def camera_snapshot():
-    # Try to get snapshot via HTTP API if available
-    import requests
+    # Try HTTP snapshot API first
     try:
         resp = requests.get(
             SNAPSHOT_URL,
-            auth=(DEVICE_USERNAME, DEVICE_PASSWORD),
-            timeout=4,
-            stream=True
+            auth=(CAMERA_USER, CAMERA_PASSWORD),
+            timeout=5,
+            stream=True,
         )
-        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image'):
-            return Response(resp.content, mimetype='image/jpeg')
+        if resp.status_code == 200:
+            data = resp.content
+            return Response(data, mimetype='image/jpeg')
     except Exception:
         pass
-
-    # Fallback: capture one frame from RTSP
+    # Fallback: grab from RTSP stream using OpenCV
     cap = cv2.VideoCapture(RTSP_URL)
+    if not cap.isOpened():
+        abort(503, "Unable to open video stream for snapshot")
     ret, frame = cap.read()
     cap.release()
     if not ret:
-        return Response("Failed to capture snapshot", status=500)
-    ret2, jpeg = cv2.imencode('.jpg', frame)
-    if not ret2:
-        return Response("Failed to encode snapshot", status=500)
+        abort(503, "Unable to capture frame")
+    ret, jpeg = cv2.imencode('.jpg', frame)
+    if not ret:
+        abort(503, "Unable to encode frame")
     return Response(jpeg.tobytes(), mimetype='image/jpeg')
 
 @app.route('/video/stream/stop', methods=['POST'])
-def stop_stream():
-    # Stop all active streams
-    stopped = 0
-    for k in list(streaming_sessions.keys()):
-        streaming_sessions[k] = False
-        stopped += 1
-    return jsonify({"message": f"Stopped {stopped} stream(s)"}), 200
+def stop_video_stream():
+    client_id = request.remote_addr + ":" + str(request.environ.get("REMOTE_PORT", ""))
+    # Signal the generator to stop
+    if client_id in streaming_flags:
+        streaming_flags[client_id] = False
+        return jsonify({"status": "stopping"}), 200
+    else:
+        return jsonify({"status": "not streaming"}), 200
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
