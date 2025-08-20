@@ -53,11 +53,15 @@ spec:
               value: "edgedevice-usb-camera-01"
             - name: EDGEDEVICE_NAMESPACE
               value: "devices"
-        - image: edgenesis/usb-camera:v0.0.2
+        - image: edgenesis/usb-camera:v0.0.3
           securityContext:
             privileged: true
           name: camera-python
           env:
+            - name: CAMERA_WIDTH
+              value: "<no value>"
+            - name: CAMERA_HEIGHT
+              value: "<no value>"
             - name: VIDEONUMBER
               value: "0"
           volumeMounts:
