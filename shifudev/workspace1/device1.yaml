@@ -1,0 +1,100 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: device1-configmap
+  namespace: deviceshifu
+  labels:
+    app: deviceshifu-device1
+    workspace_id: "f502476e-cdb9-42a3-9b77-5558157c3c56"
+    workspace_name: "workspace1"
+data:
+  driverProperties: |
+    driverSku: Robot Dog MQTT Device
+    driverImage: robot-dog-mqtt:latest
+---
+
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: edgedevice-device1
+  namespace: devices
+  labels:
+    app: deviceshifu-device1
+    workspace_id: "f502476e-cdb9-42a3-9b77-5558157c3c56"
+    workspace_name: "workspace1"
+  annotations:
+    workspace.id: "f502476e-cdb9-42a3-9b77-5558157c3c56"
+    workspace.name: "workspace1"
+    template.id: "robotdog-mqtt-v1"
+spec:
+  sku: "Robot Dog MQTT Device"
+  connection: Ethernet
+  address: "192.168.4.101"
+  protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: deviceshifu-device1
+    workspace_id: "f502476e-cdb9-42a3-9b77-5558157c3c56"
+  name: deviceshifu-device1
+  namespace: deviceshifu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deviceshifu-device1
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-device1
+        workspace_id: "f502476e-cdb9-42a3-9b77-5558157c3c56"
+    spec:
+      containers:
+        - image: edgenesis/deeprobotics-robotdog-mqtt:v0.0.2
+          name: deviceshifu-device1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: deviceshifu-config
+              mountPath: "/etc/edgedevice/config"
+              readOnly: true
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "edgedevice-device1"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+            - name: MQTT_BROKER_ADDRESS
+              value: ""
+            # No MQTT authentication configured in workspace
+            
+            - name: CONFIG_MOUNT_PATH
+              value: "/etc/edgedevice/config"
+            - name: DATA_FETCH_INTERVAL_SECONDS
+              value: "1"
+      volumes:
+        - name: deviceshifu-config
+          configMap:
+            name: device1-configmap
+      serviceAccountName: edgedevice-sa
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: deviceshifu-device1
+    workspace_id: "f502476e-cdb9-42a3-9b77-5558157c3c56"
+  name: deviceshifu-device1
+  namespace: deviceshifu
+spec:
+  ports:
+    - port: 80
+      protocol: TCP
+      targetPort: 8080
+      name: http
+  selector:
+    app: deviceshifu-device1
+  type: ClusterIP
