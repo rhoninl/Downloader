@@ -1,71 +1,68 @@
 # config.py
 import os
 import sys
-from dataclasses import dataclass
+from typing import Optional
 
 
-def _getenv_required(name: str) -> str:
-    val = os.environ.get(name)
+class ConfigError(Exception):
+    pass
+
+
+def _get_env(name: str, required: bool = True, cast: Optional[type] = None) -> Optional[object]:
+    val = os.getenv(name)
     if val is None or val == "":
-        print(f"Missing required environment variable: {name}", file=sys.stderr)
-        sys.exit(2)
-    return val
-
-
-def _getenv_float(name: str) -> float:
-    s = _getenv_required(name)
+        if required:
+            raise ConfigError(f"Missing required environment variable: {name}")
+        return None
+    if cast is None:
+        return val
     try:
-        return float(s)
-    except ValueError:
-        print(f"Invalid float for {name}: {s}", file=sys.stderr)
-        sys.exit(2)
+        if cast is bool:
+            low = val.strip().lower()
+            if low in ("1", "true", "yes", "on"): return True
+            if low in ("0", "false", "no", "off"): return False
+            raise ValueError(f"Invalid boolean for {name}: {val}")
+        return cast(val)
+    except Exception as e:
+        raise ConfigError(f"Invalid value for {name}: {val} ({e})")
 
 
-def _getenv_int(name: str) -> int:
-    s = _getenv_required(name)
-    try:
-        return int(s)
-    except ValueError:
-        print(f"Invalid int for {name}: {s}", file=sys.stderr)
-        sys.exit(2)
-
-
-@dataclass(frozen=True)
 class Config:
-    http_host: str
-    http_port: int
+    def __init__(self):
+        # HTTP Server
+        self.http_host: str = _get_env("HTTP_HOST", required=True, cast=str)  # e.g., 0.0.0.0
+        self.http_port: int = _get_env("HTTP_PORT", required=True, cast=int)  # e.g., 8080
 
-    device_base_url: str
-    device_timeout_s: float
-    device_poll_interval_s: float
-    device_retry_backoff_s: float
-    device_retry_limit: int
+        # Device connection
+        self.device_host: str = _get_env("DEVICE_HOST", required=True, cast=str)
+        self.device_port: int = _get_env("DEVICE_PORT", required=True, cast=int)
 
-    device_username: str | None
-    device_password: str | None
+        # Timeouts and retry/backoff settings (milliseconds)
+        self.connect_timeout_ms: int = _get_env("CONNECT_TIMEOUT_MS", required=True, cast=int)
+        self.read_timeout_ms: int = _get_env("READ_TIMEOUT_MS", required=True, cast=int)
+        self.retry_backoff_min_ms: int = _get_env("RETRY_BACKOFF_MS_MIN", required=True, cast=int)
+        self.retry_backoff_max_ms: int = _get_env("RETRY_BACKOFF_MS_MAX", required=True, cast=int)
+
+        # Streaming heartbeat seconds (to keep HTTP connections alive when idle)
+        self.stream_heartbeat_s: int = _get_env("STREAM_HEARTBEAT_S", required=True, cast=int)
+
+    def dump(self) -> dict:
+        return {
+            "http_host": self.http_host,
+            "http_port": self.http_port,
+            "device_host": self.device_host,
+            "device_port": self.device_port,
+            "connect_timeout_ms": self.connect_timeout_ms,
+            "read_timeout_ms": self.read_timeout_ms,
+            "retry_backoff_min_ms": self.retry_backoff_min_ms,
+            "retry_backoff_max_ms": self.retry_backoff_max_ms,
+            "stream_heartbeat_s": self.stream_heartbeat_s,
+        }
 
 
 def load_config() -> Config:
-    http_host = _getenv_required("DRIVER_HTTP_HOST")
-    http_port = _getenv_int("DRIVER_HTTP_PORT")
-
-    device_base_url = _getenv_required("DEVICE_BASE_URL").rstrip("/")
-    device_timeout_s = _getenv_float("DEVICE_TIMEOUT_S")
-    device_poll_interval_s = _getenv_float("DEVICE_POLL_INTERVAL_S")
-    device_retry_backoff_s = _getenv_float("DEVICE_RETRY_BACKOFF_S")
-    device_retry_limit = _getenv_int("DEVICE_RETRY_LIMIT")
-
-    device_username = os.environ.get("DEVICE_USERNAME") or None
-    device_password = os.environ.get("DEVICE_PASSWORD") or None
-
-    return Config(
-        http_host=http_host,
-        http_port=http_port,
-        device_base_url=device_base_url,
-        device_timeout_s=device_timeout_s,
-        device_poll_interval_s=device_poll_interval_s,
-        device_retry_backoff_s=device_retry_backoff_s,
-        device_retry_limit=device_retry_limit,
-        device_username=device_username,
-        device_password=device_password,
-    )
+    try:
+        return Config()
+    except ConfigError as e:
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(2)
