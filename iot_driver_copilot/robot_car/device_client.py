@@ -1,80 +1,110 @@
 # device_client.py
 import json
+import logging
+import threading
 import time
+import urllib.request
+import urllib.error
+import urllib.parse
 import base64
-from urllib import request, error
-from urllib.parse import urljoin
-from typing import Optional, Tuple
+import http.cookiejar
+from typing import Any, Dict, Optional
 
 
 class DeviceClient:
-    def __init__(self, base_url: str, timeout_sec: float, retry_max: int, retry_backoff_sec: float,
-                 username: Optional[str] = None, password: Optional[str] = None):
-        if not base_url.endswith('/'):
-            base_url = base_url + '/'
-        self.base_url = base_url
-        self.timeout_sec = timeout_sec
-        self.retry_max = retry_max
-        self.retry_backoff_sec = retry_backoff_sec
-        self._auth_header = None
-        if username and password:
-            token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-            self._auth_header = f"Basic {token}"
+    def __init__(self, base_url: str, timeout_s: float, username: Optional[str], password: Optional[str]):
+        self._base_url = base_url.rstrip('/')
+        self._timeout = timeout_s
+        self._username = username
+        self._password = password
+        self._opener_lock = threading.Lock()
+        self._opener = self._build_opener()
+        self._last_status_code = None
 
-    def _request(self, path: str, payload: Optional[dict]) -> Tuple[int, bytes]:
-        url = urljoin(self.base_url, path.lstrip('/'))
-        data = None
+    def _build_opener(self):
+        cj = http.cookiejar.CookieJar()
+        handlers = [urllib.request.HTTPCookieProcessor(cj)]
+        opener = urllib.request.build_opener(*handlers)
+        return opener
+
+    def _headers(self) -> Dict[str, str]:
         headers = {
-            'Accept': 'application/json',
+            'Accept': 'application/json, text/plain, */*',
         }
-        if payload is not None:
-            data = json.dumps(payload).encode('utf-8')
+        if self._username and self._password:
+            creds = f"{self._username}:{self._password}".encode('utf-8')
+            b64 = base64.b64encode(creds).decode('ascii')
+            headers['Authorization'] = f"Basic {b64}"
+        return headers
+
+    def _url(self, path: str) -> str:
+        if not path.startswith('/'):
+            path = '/' + path
+        return self._base_url + path
+
+    def _request(self, method: str, path: str, json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = self._url(path)
+        data = None
+        headers = self._headers()
+        if json_body is not None:
+            body = json.dumps(json_body).encode('utf-8')
             headers['Content-Type'] = 'application/json'
-        if self._auth_header:
-            headers['Authorization'] = self._auth_header
+            data = body
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with self._opener_lock:
+                with self._opener.open(req, timeout=self._timeout) as resp:
+                    self._last_status_code = resp.getcode()
+                    content_type = resp.headers.get('Content-Type', '')
+                    raw = resp.read()
+                    if 'application/json' in content_type:
+                        try:
+                            return json.loads(raw.decode('utf-8'))
+                        except Exception:
+                            # Malformed json; return text payload
+                            return {'raw': raw.decode('utf-8', errors='replace')}
+                    else:
+                        # assume text or empty
+                        text = raw.decode('utf-8', errors='replace')
+                        return {'raw': text}
+        except urllib.error.HTTPError as e:
+            self._last_status_code = e.code
+            raw = e.read().decode('utf-8', errors='replace') if e.fp else ''
+            logging.warning("Device HTTP error %s on %s %s: %s", e.code, method, url, raw)
+            raise
+        except urllib.error.URLError as e:
+            logging.warning("Device URL error on %s %s: %s", method, url, e)
+            raise
 
-        last_exc = None
-        for attempt in range(self.retry_max + 1):
-            try:
-                req = request.Request(url=url, data=data, method='POST', headers=headers)
-                with request.urlopen(req, timeout=self.timeout_sec) as resp:
-                    status = resp.getcode()
-                    body = resp.read()
-                    return status, body
-            except (error.HTTPError, error.URLError) as e:
-                last_exc = e
-                if attempt < self.retry_max:
-                    sleep_for = self._compute_backoff(attempt)
-                    time.sleep(sleep_for)
-                else:
-                    break
-        if isinstance(last_exc, error.HTTPError):
-            # propagate HTTP error body if available
-            try:
-                body = last_exc.read()
-            except Exception:
-                body = b''
-            return last_exc.code, body
-        raise last_exc  # URLError or other
+    # Device operations
+    def connect(self) -> Dict[str, Any]:
+        logging.info("Calling device /connect")
+        return self._request('POST', '/connect', json_body=None)
 
-    def _compute_backoff(self, attempt: int) -> float:
-        # exponential backoff: base * 2^attempt
-        return self.retry_backoff_sec * (2 ** attempt)
-
-    def connect(self) -> Tuple[int, bytes]:
-        return self._request('/connect', payload=None)
-
-    def stop(self) -> Tuple[int, bytes]:
-        return self._request('/stop', payload=None)
-
-    def move_forward(self, speed: float, duration: Optional[float]) -> Tuple[int, bytes]:
-        payload = {'speed': float(speed)}
+    def move_forward(self, speed: float, duration: Optional[float]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {'speed': speed}
         if duration is not None:
-            payload['duration'] = float(duration)
-        return self._request('/move/forward', payload=payload)
+            payload['duration'] = duration
+        logging.info("Calling device /move/forward speed=%s duration=%s", speed, duration)
+        return self._request('POST', '/move/forward', json_body=payload)
 
-    def move_backward(self, speed: float, duration: Optional[float]) -> Tuple[int, bytes]:
-        payload = {'speed': float(speed)}
+    def move_backward(self, speed: float, duration: Optional[float]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {'speed': speed}
         if duration is not None:
-            payload['duration'] = float(duration)
-        return self._request('/move/backward', payload=payload)
+            payload['duration'] = duration
+        logging.info("Calling device /move/backward speed=%s duration=%s", speed, duration)
+        return self._request('POST', '/move/backward', json_body=payload)
+
+    def stop(self) -> Dict[str, Any]:
+        logging.info("Calling device /stop")
+        return self._request('POST', '/stop', json_body=None)
+
+    def fetch_status(self) -> Dict[str, Any]:
+        # Many devices expose a status endpoint; we attempt it.
+        # If not available, the caller will handle errors gracefully.
+        logging.debug("Polling device /status")
+        return self._request('GET', '/status', json_body=None)
+
+    @property
+    def last_status_code(self) -> Optional[int]:
+        return self._last_status_code
