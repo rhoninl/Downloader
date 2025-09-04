@@ -1,125 +1,68 @@
 import os
 import sys
-from dataclasses import dataclass
 from typing import Optional
 
-
-@dataclass
 class Config:
-    http_host: str
-    http_port: int
+    def __init__(self):
+        # HTTP server configuration
+        self.http_host = self._require('HTTP_HOST')
+        self.http_port = self._require_int('HTTP_PORT')
 
-    device_base_url: str
-    device_telemetry_path: str
-    device_velocity_cmd_path: str
+        # Device base URL (e.g., http://robot.local:8080)
+        self.device_base_url = self._require('DEVICE_BASE_URL')
 
-    telemetry_url: str
-    velocity_cmd_url: str
+        # Device command endpoint paths (relative to base)
+        self.device_move_path = self._require('DEVICE_MOVE_PATH')  # e.g., /api/commands/move_velocity
 
-    default_linear_velocity: Optional[float]
+        # Optional device status path for polling latest state
+        self.device_status_path = os.getenv('DEVICE_STATUS_PATH')  # e.g., /api/state
 
-    http_timeout_sec: float
-    poll_interval_sec: float
-    retry_initial_backoff_sec: float
-    retry_max_backoff_sec: float
+        # Authentication (optional): Bearer token or Basic auth
+        self.device_bearer_token = os.getenv('DEVICE_BEARER_TOKEN')
+        self.device_basic_user = os.getenv('DEVICE_BASIC_USER')
+        self.device_basic_pass = os.getenv('DEVICE_BASIC_PASS')
 
-    log_level: str
+        # Timeouts and retries
+        self.request_timeout_sec = self._require_float('REQUEST_TIMEOUT_SEC')
+        self.cmd_max_retries = self._require_int('CMD_MAX_RETRIES')
 
-    device_auth_token: Optional[str]
-    device_username: Optional[str]
-    device_password: Optional[str]
+        # Polling config only required if status path is provided
+        if self.device_status_path:
+            self.poll_interval_sec = self._require_float('POLL_INTERVAL_SEC')
+            self.retry_backoff_init_ms = self._require_int('RETRY_BACKOFF_INIT_MS')
+            self.retry_backoff_max_ms = self._require_int('RETRY_BACKOFF_MAX_MS')
+        else:
+            self.poll_interval_sec = None
+            self.retry_backoff_init_ms = None
+            self.retry_backoff_max_ms = None
 
+    def _require(self, key: str) -> str:
+        val = os.getenv(key)
+        if val is None or val == '':
+            print(f"Missing required env var: {key}", file=sys.stderr)
+            sys.exit(1)
+        return val
 
-def _getenv_required(key: str) -> str:
-    val = os.getenv(key)
-    if val is None or val == "":
-        sys.stderr.write(f"Missing required environment variable: {key}\n")
-        sys.exit(2)
-    return val
+    def _require_int(self, key: str) -> int:
+        val = self._require(key)
+        try:
+            return int(val)
+        except ValueError:
+            print(f"Env var {key} must be an integer", file=sys.stderr)
+            sys.exit(1)
 
+    def _require_float(self, key: str) -> float:
+        val = self._require(key)
+        try:
+            return float(val)
+        except ValueError:
+            print(f"Env var {key} must be a float", file=sys.stderr)
+            sys.exit(1)
 
-def _getenv_optional(key: str) -> Optional[str]:
-    val = os.getenv(key)
-    if val is None or val == "":
-        return None
-    return val
+CONFIG: Optional[Config] = None
 
-
-def _to_int(name: str, val: str) -> int:
-    try:
-        return int(val)
-    except Exception:
-        sys.stderr.write(f"Invalid int for {name}: {val}\n")
-        sys.exit(2)
-
-
-def _to_float(name: str, val: str) -> float:
-    try:
-        return float(val)
-    except Exception:
-        sys.stderr.write(f"Invalid float for {name}: {val}\n")
-        sys.exit(2)
-
-
-def _to_optional_float(name: str, val: Optional[str]) -> Optional[float]:
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except Exception:
-        sys.stderr.write(f"Invalid float for {name}: {val}\n")
-        sys.exit(2)
-
-
-def load_config() -> Config:
-    http_host = _getenv_required("HTTP_HOST")
-    http_port = _to_int("HTTP_PORT", _getenv_required("HTTP_PORT"))
-
-    device_base_url = _getenv_required("DEVICE_BASE_URL").rstrip("/")
-    device_telemetry_path = _getenv_required("DEVICE_TELEMETRY_PATH")
-    if not device_telemetry_path.startswith("/"):
-        device_telemetry_path = "/" + device_telemetry_path
-    device_velocity_cmd_path = _getenv_required("DEVICE_VELOCITY_CMD_PATH")
-    if not device_velocity_cmd_path.startswith("/"):
-        device_velocity_cmd_path = "/" + device_velocity_cmd_path
-
-    telemetry_url = f"{device_base_url}{device_telemetry_path}"
-    velocity_cmd_url = f"{device_base_url}{device_velocity_cmd_path}"
-
-    default_linear_velocity = _to_optional_float(
-        "DEFAULT_LINEAR_VELOCITY", _getenv_optional("DEFAULT_LINEAR_VELOCITY")
-    )
-
-    http_timeout_sec = _to_float("HTTP_TIMEOUT_SEC", _getenv_required("HTTP_TIMEOUT_SEC"))
-    poll_interval_sec = _to_float("POLL_INTERVAL_SEC", _getenv_required("POLL_INTERVAL_SEC"))
-    retry_initial_backoff_sec = _to_float(
-        "RETRY_INITIAL_BACKOFF_SEC", _getenv_required("RETRY_INITIAL_BACKOFF_SEC")
-    )
-    retry_max_backoff_sec = _to_float(
-        "RETRY_MAX_BACKOFF_SEC", _getenv_required("RETRY_MAX_BACKOFF_SEC")
-    )
-
-    log_level = _getenv_required("LOG_LEVEL").upper()
-
-    device_auth_token = _getenv_optional("DEVICE_AUTH_TOKEN")
-    device_username = _getenv_optional("DEVICE_USERNAME")
-    device_password = _getenv_optional("DEVICE_PASSWORD")
-
-    return Config(
-        http_host=http_host,
-        http_port=http_port,
-        device_base_url=device_base_url,
-        device_telemetry_path=device_telemetry_path,
-        device_velocity_cmd_path=device_velocity_cmd_path,
-        telemetry_url=telemetry_url,
-        velocity_cmd_url=velocity_cmd_url,
-        default_linear_velocity=default_linear_velocity,
-        http_timeout_sec=http_timeout_sec,
-        poll_interval_sec=poll_interval_sec,
-        retry_initial_backoff_sec=retry_initial_backoff_sec,
-        retry_max_backoff_sec=retry_max_backoff_sec,
-        log_level=log_level,
-        device_auth_token=device_auth_token,
-        device_username=device_username,
-        device_password=device_password,
-    )
+def get_config() -> Config:
+    global CONFIG
+    if CONFIG is None:
+        CONFIG = Config()
+    return CONFIG
