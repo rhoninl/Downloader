@@ -1,76 +1,64 @@
-# config.py
-# Configuration management for the robot driver
-
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 
-def _get_env_str(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
-    val = os.getenv(name, default)
-    if required and (val is None or val.strip() == ""):
-        raise ValueError(f"Missing required environment variable: {name}")
-    return val
-
-
-def _get_env_float(name: str, default: Optional[float] = None, required: bool = False) -> Optional[float]:
+def _get_env(name: str, default: str | None = None) -> str | None:
     val = os.getenv(name)
-    if val is None or val.strip() == "":
-        if required and default is None:
-            raise ValueError(f"Missing required environment variable: {name}")
+    if val is None:
+        return default
+    return val.strip()
+
+
+def _get_float(name: str, default: float) -> float:
+    v = _get_env(name)
+    if v is None or v == "":
         return default
     try:
-        return float(val)
+        return float(v)
     except ValueError:
-        raise ValueError(f"Invalid float for {name}: {val}")
+        return default
 
 
-def _get_env_int(name: str, default: Optional[int] = None, required: bool = False) -> Optional[int]:
-    val = os.getenv(name)
-    if val is None or val.strip() == "":
-        if required and default is None:
-            raise ValueError(f"Missing required environment variable: {name}")
+def _get_int(name: str, default: int) -> int:
+    v = _get_env(name)
+    if v is None or v == "":
         return default
     try:
-        return int(val)
+        return int(v)
     except ValueError:
-        raise ValueError(f"Invalid int for {name}: {val}")
+        return default
 
 
 @dataclass
 class Config:
-    # HTTP server config
     http_host: str
     http_port: int
-
-    # Device access config (HTTP/REST)
-    robot_base_url: str
-    robot_state_path: str
-    robot_cmd_move_path: str
-
-    robot_user: Optional[str]
-    robot_pass: Optional[str]
-
-    # Networking behavior
-    robot_timeout_s: float
-    robot_poll_interval_s: float
-    robot_retry_backoff_s: float
-
-    # Default control parameters
-    default_linear_vel: float
+    device_poll_url: str
+    poll_interval_sec: float
+    http_timeout_sec: float
+    backoff_initial_sec: float
+    backoff_max_sec: float
+    log_level: str
+    auth_bearer_token: str | None
+    basic_auth_user: str | None
+    basic_auth_pass: str | None
 
 
 def load_config() -> Config:
+    device_poll_url = _get_env("DEVICE_POLL_URL")
+    if not device_poll_url:
+        raise SystemExit("DEVICE_POLL_URL is required")
+
     return Config(
-        http_host=_get_env_str("HTTP_HOST", "0.0.0.0"),
-        http_port=_get_env_int("HTTP_PORT", 8000) or 8000,
-        robot_base_url=_get_env_str("ROBOT_BASE_URL", required=True),
-        robot_state_path=_get_env_str("ROBOT_STATE_PATH", "/state"),
-        robot_cmd_move_path=_get_env_str("ROBOT_CMD_MOVE_PATH", "/cmd/move_velocity"),
-        robot_user=_get_env_str("ROBOT_USER"),
-        robot_pass=_get_env_str("ROBOT_PASS"),
-        robot_timeout_s=_get_env_float("ROBOT_TIMEOUT_S", 5.0) or 5.0,
-        robot_poll_interval_s=_get_env_float("ROBOT_POLL_INTERVAL_S", 0.5) or 0.5,
-        robot_retry_backoff_s=_get_env_float("ROBOT_RETRY_BACKOFF_S", 2.0) or 2.0,
-        default_linear_vel=_get_env_float("DEFAULT_LINEAR_VEL", 0.2) or 0.2,
+        http_host=_get_env("HTTP_HOST", "0.0.0.0"),
+        http_port=_get_int("HTTP_PORT", 8000),
+        device_poll_url=device_poll_url,
+        poll_interval_sec=_get_float("POLL_INTERVAL_SEC", 0.5),
+        http_timeout_sec=_get_float("DEVICE_HTTP_TIMEOUT_SEC", 5.0),
+        backoff_initial_sec=_get_float("RETRY_BACKOFF_INITIAL_SEC", 1.0),
+        backoff_max_sec=_get_float("RETRY_BACKOFF_MAX_SEC", 30.0),
+        log_level=_get_env("LOG_LEVEL", "INFO"),
+        auth_bearer_token=_get_env("AUTH_BEARER_TOKEN"),
+        basic_auth_user=_get_env("BASIC_AUTH_USER"),
+        basic_auth_pass=_get_env("BASIC_AUTH_PASS"),
     )
