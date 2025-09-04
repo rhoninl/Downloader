@@ -1,97 +1,67 @@
 # config.py
+# Configuration loader for the robot driver. All values taken from environment variables.
+
 import os
-import sys
-from urllib.parse import urlparse
+from dataclasses import dataclass
+from typing import Optional
 
-class Config:
-    def __init__(self):
-        self.http_host = os.getenv('HTTP_HOST', '0.0.0.0')
-        try:
-            self.http_port = int(os.getenv('HTTP_PORT', '8000'))
-        except ValueError:
-            print('Invalid HTTP_PORT, must be int', file=sys.stderr)
-            sys.exit(1)
 
-        self.device_base_url = os.getenv('DEVICE_BASE_URL')
-        if not self.device_base_url:
-            print('DEVICE_BASE_URL is required', file=sys.stderr)
-            sys.exit(1)
+def _get_env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = val.strip()
+    return val if val != "" else default
 
-        self.device_username = os.getenv('DEVICE_USERNAME')
-        self.device_password = os.getenv('DEVICE_PASSWORD')
 
-        # Timeouts and retry
-        try:
-            self.request_timeout_sec = float(os.getenv('REQUEST_TIMEOUT_SEC', '5.0'))
-        except ValueError:
-            print('Invalid REQUEST_TIMEOUT_SEC', file=sys.stderr)
-            sys.exit(1)
+def _get_env_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
 
-        try:
-            self.retry_max_attempts = int(os.getenv('RETRY_MAX_ATTEMPTS', '3'))
-        except ValueError:
-            print('Invalid RETRY_MAX_ATTEMPTS', file=sys.stderr)
-            sys.exit(1)
 
-        try:
-            self.retry_backoff_ms = int(os.getenv('RETRY_BACKOFF_MS', '500'))
-        except ValueError:
-            print('Invalid RETRY_BACKOFF_MS', file=sys.stderr)
-            sys.exit(1)
+def _get_env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
 
-        try:
-            self.stream_interval_ms = int(os.getenv('STREAM_INTERVAL_MS', '1000'))
-        except ValueError:
-            print('Invalid STREAM_INTERVAL_MS', file=sys.stderr)
-            sys.exit(1)
 
-        try:
-            self.connect_check_interval_ms = int(os.getenv('CONNECT_CHECK_INTERVAL_MS', '1000'))
-        except ValueError:
-            print('Invalid CONNECT_CHECK_INTERVAL_MS', file=sys.stderr)
-            sys.exit(1)
+@dataclass
+class DriverConfig:
+    http_host: str
+    http_port: int
+    device_base_url: str
+    device_username: Optional[str]
+    device_password: Optional[str]
+    request_timeout: float
+    max_retries: int
+    retry_backoff_initial: float
+    retry_backoff_max: float
+    ping_interval: float
+    shutdown_grace: float
+    stream_heartbeat_interval: float
 
-        try:
-            self.shutdown_grace_sec = float(os.getenv('SHUTDOWN_GRACE_SEC', '5.0'))
-        except ValueError:
-            print('Invalid SHUTDOWN_GRACE_SEC', file=sys.stderr)
-            sys.exit(1)
 
-        self._parsed = urlparse(self.device_base_url)
-        if self._parsed.scheme not in ('http', 'https'):
-            print('DEVICE_BASE_URL must be http or https', file=sys.stderr)
-            sys.exit(1)
-        if not self._parsed.hostname:
-            print('DEVICE_BASE_URL must include host', file=sys.stderr)
-            sys.exit(1)
-
-    @property
-    def device_scheme(self):
-        return self._parsed.scheme
-
-    @property
-    def device_host(self):
-        return self._parsed.hostname
-
-    @property
-    def device_port(self):
-        if self._parsed.port:
-            return self._parsed.port
-        return 443 if self._parsed.scheme == 'https' else 80
-
-    @property
-    def device_base_path(self):
-        # Ensure base path has no trailing slash for joining
-        p = self._parsed.path or ''
-        if p.endswith('/'):
-            p = p[:-1]
-        return p
-
-    def join_device_path(self, path: str) -> str:
-        # Create absolute path combining base path and provided path
-        base = self.device_base_path
-        if not path.startswith('/'):
-            path = '/' + path
-        if base:
-            return base + path
-        return path
+def load_config() -> DriverConfig:
+    return DriverConfig(
+        http_host=_get_env_str("HTTP_HOST", "0.0.0.0"),
+        http_port=_get_env_int("HTTP_PORT", 8080),
+        device_base_url=_get_env_str("DEVICE_BASE_URL", ""),
+        device_username=_get_env_str("DEVICE_USERNAME", None),
+        device_password=_get_env_str("DEVICE_PASSWORD", None),
+        request_timeout=_get_env_float("REQUEST_TIMEOUT", 5.0),
+        max_retries=_get_env_int("MAX_RETRIES", 3),
+        retry_backoff_initial=_get_env_float("RETRY_BACKOFF_INITIAL", 0.5),
+        retry_backoff_max=_get_env_float("RETRY_BACKOFF_MAX", 5.0),
+        ping_interval=_get_env_float("PING_INTERVAL", 5.0),
+        shutdown_grace=_get_env_float("SHUTDOWN_GRACE", 3.0),
+        stream_heartbeat_interval=_get_env_float("STREAM_HEARTBEAT_INTERVAL", 15.0),
+    )

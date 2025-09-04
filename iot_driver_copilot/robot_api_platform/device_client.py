@@ -1,96 +1,98 @@
 # device_client.py
+# Robot device client using the device's native HTTP API for movement commands.
+
+from urllib import request, parse, error
 import base64
-import json
 import time
-import logging
-import socket
-from http.client import HTTPConnection, HTTPSConnection, ResponseException
-from urllib.parse import urlencode
 from typing import Optional, Tuple
+from urllib.parse import urlparse, urljoin
 
-from config import Config
 
-logger = logging.getLogger(__name__)
+class DeviceHTTPClient:
+    def __init__(
+        self,
+        base_url: str,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        timeout: float = 5.0,
+        max_retries: int = 3,
+        backoff_initial: float = 0.5,
+        backoff_max: float = 5.0,
+    ) -> None:
+        if not base_url:
+            raise ValueError("DEVICE_BASE_URL is required")
+        self.base_url = base_url.rstrip("/")
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff_initial = backoff_initial
+        self.backoff_max = backoff_max
 
-class DeviceClient:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self._auth_header = None
-        if cfg.device_username is not None and cfg.device_password is not None:
-            token = f"{cfg.device_username}:{cfg.device_password}".encode('utf-8')
-            self._auth_header = 'Basic ' + base64.b64encode(token).decode('ascii')
-
-    def _conn(self):
-        if self.cfg.device_scheme == 'https':
-            return HTTPSConnection(self.cfg.device_host, self.cfg.device_port, timeout=self.cfg.request_timeout_sec)
+        # Parse host and port for reachability checks (optional)
+        parsed = urlparse(self.base_url)
+        self.scheme = parsed.scheme or "http"
+        self.host = parsed.hostname or ""
+        if parsed.port:
+            self.port = parsed.port
         else:
-            return HTTPConnection(self.cfg.device_host, self.cfg.device_port, timeout=self.cfg.request_timeout_sec)
+            if self.scheme == "https":
+                self.port = 443
+            else:
+                self.port = 80
 
-    def send_get(self, path: str, params: Optional[dict] = None) -> Tuple[int, bytes, float]:
-        attempts = 0
-        backoff = self.cfg.retry_backoff_ms / 1000.0
-        last_exc = None
-        while attempts < self.cfg.retry_max_attempts:
-            attempts += 1
+    def _auth_header(self) -> Optional[Tuple[str, str]]:
+        if self.username is not None and self.password is not None:
+            token = f"{self.username}:{self.password}".encode("utf-8")
+            b64 = base64.b64encode(token).decode("ascii")
+            return ("Authorization", f"Basic {b64}")
+        return None
+
+    def _build_url(self, path: str, query: Optional[dict] = None) -> str:
+        # Ensure trailing slash in base when joining a relative path
+        base = self.base_url + ("/" if not self.base_url.endswith("/") else "")
+        url = urljoin(base, path.lstrip("/"))
+        if query:
+            return url + "?" + parse.urlencode(query)
+        return url
+
+    def _do_get(self, url: str) -> Tuple[int, bytes]:
+        headers = {
+            "Accept": "application/json, */*;q=0.1",
+            "User-Agent": "robot-driver/1.0",
+        }
+        auth = self._auth_header()
+        if auth:
+            headers[auth[0]] = auth[1]
+        req = request.Request(url=url, method="GET", headers=headers)
+
+        attempt = 0
+        backoff = self.backoff_initial
+        while True:
             try:
-                full_path = self.cfg.join_device_path(path)
-                if params:
-                    query = urlencode(params, doseq=True)
-                    if '?' in full_path:
-                        full_path = full_path + '&' + query
-                    else:
-                        full_path = full_path + '?' + query
-                conn = self._conn()
-                headers = {}
-                if self._auth_header:
-                    headers['Authorization'] = self._auth_header
-                start = time.monotonic()
-                conn.request('GET', full_path, headers=headers)
-                resp = conn.getresponse()
-                body = resp.read()
-                rtt = (time.monotonic() - start) * 1000.0
-                status = resp.status
-                conn.close()
-                logger.info('Device GET %s -> %s in %.1fms', full_path, status, rtt)
-                return status, body, rtt
-            except Exception as e:  # noqa: BLE001
-                last_exc = e
-                logger.warning('Device GET attempt %d failed: %s', attempts, e)
-                time.sleep(backoff)
-                backoff *= 2
-        # After retries
-        raise RuntimeError(f'Device GET failed after {self.cfg.retry_max_attempts} attempts: {last_exc}')
+                with request.urlopen(req, timeout=self.timeout) as resp:
+                    status = resp.getcode()
+                    data = resp.read() or b""
+                    return status, data
+            except (error.URLError, error.HTTPError) as e:
+                attempt += 1
+                if attempt > self.max_retries:
+                    if isinstance(e, error.HTTPError):
+                        try:
+                            body = e.read()  # type: ignore[attr-defined]
+                        except Exception:
+                            body = b""
+                        return e.code if hasattr(e, "code") else 599, body  # type: ignore[attr-defined]
+                    return 599, str(e).encode("utf-8")
+                time.sleep(min(backoff, self.backoff_max))
+                backoff = min(backoff * 2.0, self.backoff_max)
 
-    def head_root(self) -> Tuple[bool, Optional[int], float, Optional[str]]:
-        # Perform a HEAD / to validate HTTP service and measure RTT
-        try:
-            conn = self._conn()
-            start = time.monotonic()
-            conn.request('HEAD', self.cfg.join_device_path('/') if self.cfg.device_base_path else '/')
-            resp = conn.getresponse()
-            # Reading body is not necessary for HEAD but ensure release
-            _ = resp.read()
-            rtt = (time.monotonic() - start) * 1000.0
-            status = resp.status
-            conn.close()
-            logger.debug('Device HEAD / -> %s in %.1fms', status, rtt)
-            return True, status, rtt, None
-        except Exception as e:  # noqa: BLE001
-            logger.debug('Device HEAD failed: %s', e)
-            return False, None, 0.0, str(e)
+    def move_forward(self, linear_velocity: float) -> Tuple[int, bytes, str]:
+        url = self._build_url("/move/forward", {"linear_velocity": str(linear_velocity)})
+        status, body = self._do_get(url)
+        return status, body, url
 
-    def port_reachable(self) -> Tuple[bool, float, Optional[str]]:
-        # Lightweight TCP connect test
-        start = time.monotonic()
-        try:
-            with socket.create_connection((self.cfg.device_host, self.cfg.device_port), timeout=self.cfg.request_timeout_sec):
-                rtt = (time.monotonic() - start) * 1000.0
-                return True, rtt, None
-        except Exception as e:  # noqa: BLE001
-            return False, 0.0, str(e)
-
-    def move_forward(self, linear_velocity: float) -> Tuple[int, bytes, float]:
-        return self.send_get('/move/forward', {'linear_velocity': linear_velocity})
-
-    def move_backward(self, linear_velocity: float) -> Tuple[int, bytes, float]:
-        return self.send_get('/move/backward', {'linear_velocity': linear_velocity})
+    def move_backward(self, linear_velocity: float) -> Tuple[int, bytes, str]:
+        url = self._build_url("/move/backward", {"linear_velocity": str(linear_velocity)})
+        status, body = self._do_get(url)
+        return status, body, url
