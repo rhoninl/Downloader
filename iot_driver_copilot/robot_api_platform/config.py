@@ -1,67 +1,45 @@
 # config.py
-# Configuration loader for the robot driver. All values taken from environment variables.
-
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 
-def _get_env_str(name: str, default: Optional[str] = None) -> Optional[str]:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    val = val.strip()
-    return val if val != "" else default
+def _getenv(name: str, default: str):
+    return os.environ.get(name, default)
 
 
-def _get_env_float(name: str, default: float) -> float:
-    val = os.getenv(name)
-    if val is None or val.strip() == "":
-        return default
+def _getenv_float(name: str, default: float) -> float:
     try:
-        return float(val)
-    except ValueError:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
         return default
 
 
-def _get_env_int(name: str, default: int) -> int:
-    val = os.getenv(name)
-    if val is None or val.strip() == "":
-        return default
+def _getenv_int(name: str, default: int) -> int:
     try:
-        return int(val)
-    except ValueError:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
         return default
 
 
 @dataclass
-class DriverConfig:
-    http_host: str
-    http_port: int
-    device_base_url: str
-    device_username: Optional[str]
-    device_password: Optional[str]
-    request_timeout: float
-    max_retries: int
-    retry_backoff_initial: float
-    retry_backoff_max: float
-    ping_interval: float
-    shutdown_grace: float
-    stream_heartbeat_interval: float
+class Config:
+    # HTTP server configuration
+    http_host: str = _getenv("HTTP_HOST", "0.0.0.0")
+    http_port: int = _getenv_int("HTTP_PORT", 8080)
 
+    # Device connectivity
+    device_host: str = _getenv("DEVICE_HOST", "127.0.0.1")
+    device_ctrl_port: int = _getenv_int("DEVICE_CTRL_PORT", 9000)
+    device_tel_port: int = _getenv_int("DEVICE_TEL_PORT", 9001)
 
-def load_config() -> DriverConfig:
-    return DriverConfig(
-        http_host=_get_env_str("HTTP_HOST", "0.0.0.0"),
-        http_port=_get_env_int("HTTP_PORT", 8080),
-        device_base_url=_get_env_str("DEVICE_BASE_URL", ""),
-        device_username=_get_env_str("DEVICE_USERNAME", None),
-        device_password=_get_env_str("DEVICE_PASSWORD", None),
-        request_timeout=_get_env_float("REQUEST_TIMEOUT", 5.0),
-        max_retries=_get_env_int("MAX_RETRIES", 3),
-        retry_backoff_initial=_get_env_float("RETRY_BACKOFF_INITIAL", 0.5),
-        retry_backoff_max=_get_env_float("RETRY_BACKOFF_MAX", 5.0),
-        ping_interval=_get_env_float("PING_INTERVAL", 5.0),
-        shutdown_grace=_get_env_float("SHUTDOWN_GRACE", 3.0),
-        stream_heartbeat_interval=_get_env_float("STREAM_HEARTBEAT_INTERVAL", 15.0),
-    )
+    # Timeouts and retry/backoff
+    connect_timeout: float = _getenv_float("CONNECT_TIMEOUT", 5.0)
+    read_timeout: float = _getenv_float("READ_TIMEOUT", 5.0)
+    reconnect_delay_min: float = _getenv_float("RECONNECT_DELAY_MIN", 0.5)
+    reconnect_delay_max: float = _getenv_float("RECONNECT_DELAY_MAX", 5.0)
+
+    # Movement defaults
+    linear_velocity_default: float = _getenv_float("LINEAR_VELOCITY_DEFAULT", 0.2)
+
+    # Logging
+    log_level: str = _getenv("LOG_LEVEL", "INFO").upper()
