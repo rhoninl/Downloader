@@ -1,227 +1,163 @@
 # device_client.py
+# REST client and background ingest for the robot device
+
 import json
 import logging
-import socket
 import threading
 import time
-from typing import Optional, Tuple, Any, Dict
+import urllib.request
+import urllib.error
+import urllib.parse
+from typing import Any, Dict, Optional
 
 
 class DeviceClient:
-    """
-    Device client that talks to the robot car using a simple TCP line protocol.
-    Outbound commands (ASCII lines):
-      - MOVE FORWARD <velocity>\n
-      - MOVE BACKWARD <velocity>\n
-    Inbound telemetry (JSON Lines): one JSON object per line, e.g.
-      {"ts": 1712345678.123, "speed": 0.50, "battery": 87}
-    """
-
-    def __init__(self,
-                 host: str,
-                 port: int,
-                 connect_timeout_sec: float,
-                 read_timeout_sec: float,
-                 reconnect_initial_delay_sec: float,
-                 reconnect_max_delay_sec: float):
-        self.host = host
-        self.port = port
-        self.connect_timeout_sec = connect_timeout_sec
-        self.read_timeout_sec = read_timeout_sec
-        self.reconnect_initial_delay_sec = reconnect_initial_delay_sec
-        self.reconnect_max_delay_sec = reconnect_max_delay_sec
-
-        self._sock: Optional[socket.socket] = None
-        self._sock_lock = threading.Lock()
+    def __init__(
+        self,
+        base_url: str,
+        state_path: str,
+        cmd_move_path: str,
+        user: Optional[str],
+        passwd: Optional[str],
+        timeout_s: float,
+        poll_interval_s: float,
+        retry_backoff_s: float,
+    ) -> None:
+        self.base_url = base_url.rstrip('/')
+        self.state_url = self.base_url + (state_path if state_path.startswith('/') else '/' + state_path)
+        self.move_url = self.base_url + (cmd_move_path if cmd_move_path.startswith('/') else '/' + cmd_move_path)
+        self.user = user
+        self.passwd = passwd
+        self.timeout_s = timeout_s
+        self.poll_interval_s = poll_interval_s
+        self.retry_backoff_s = retry_backoff_s
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        self._connected = False
-        self._last_error: Optional[str] = None
+        self._lock = threading.RLock()
+        self._cv = threading.Condition(self._lock)
+        self._latest: Optional[Dict[str, Any]] = None
+        self._last_update_ts: Optional[float] = None
+        self._connected: bool = False
+        self._samples_count: int = 0
+        self._errors_count: int = 0
+        self._start_monotonic = time.monotonic()
 
-        self._latest_sample: Optional[Dict[str, Any]] = None
-        self._latest_sample_ts: Optional[float] = None
-        self._sample_seq: int = 0
-
-        self._cond = threading.Condition()
-
-        self._total_samples = 0
-        self._reconnects = 0
-        self._start_time = time.time()
-
-        self._logger = logging.getLogger("DeviceClient")
+    @property
+    def condition(self) -> threading.Condition:
+        return self._cv
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, name="device-client", daemon=True)
+        self._thread = threading.Thread(target=self._ingest_loop, name="device-ingest", daemon=True)
         self._thread.start()
-        self._logger.info("Device client started background thread")
 
     def stop(self) -> None:
         self._stop_event.set()
-        try:
-            with self._sock_lock:
-                if self._sock:
-                    try:
-                        self._sock.shutdown(socket.SHUT_RDWR)
-                    except Exception:
-                        pass
-                    try:
-                        self._sock.close()
-                    except Exception:
-                        pass
-                    self._sock = None
-        except Exception:
-            pass
         if self._thread:
             self._thread.join(timeout=5)
-        with self._cond:
-            self._cond.notify_all()
-        self._logger.info("Device client stopped")
 
-    def is_connected(self) -> bool:
-        return self._connected
+    def _auth_header(self) -> Optional[str]:
+        if self.user:
+            import base64
+            creds = f"{self.user}:{self.passwd or ''}".encode('utf-8')
+            return 'Basic ' + base64.b64encode(creds).decode('ascii')
+        return None
 
-    def uptime(self) -> float:
-        return time.time() - self._start_time
+    def _http_get_json(self, url: str) -> Dict[str, Any]:
+        headers = {
+            'Accept': 'application/json',
+        }
+        ah = self._auth_header()
+        if ah:
+            headers['Authorization'] = ah
+        req = urllib.request.Request(url=url, headers=headers, method='GET')
+        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            charset = resp.headers.get_content_charset() or 'utf-8'
+            data = resp.read().decode(charset)
+            return json.loads(data)
+
+    def _http_post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        body = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        }
+        ah = self._auth_header()
+        if ah:
+            headers['Authorization'] = ah
+        req = urllib.request.Request(url=url, data=body, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            charset = resp.headers.get_content_charset() or 'utf-8'
+            data = resp.read().decode(charset)
+            try:
+                return json.loads(data)
+            except json.JSONDecodeError:
+                return {"status": "ok", "raw": data}
+
+    def _ingest_loop(self) -> None:
+        log = logging.getLogger('DeviceClient')
+        log.info(f"Starting ingest loop polling %s every %.3fs", self.state_url, self.poll_interval_s)
+        next_delay = self.poll_interval_s
+        while not self._stop_event.is_set():
+            try:
+                data = self._http_get_json(self.state_url)
+                now = time.time()
+                with self._lock:
+                    self._latest = data
+                    self._last_update_ts = now
+                    self._samples_count += 1
+                    self._connected = True
+                    self._cv.notify_all()
+                next_delay = self.poll_interval_s
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+                with self._lock:
+                    self._errors_count += 1
+                    # flag disconnected but keep last data
+                    self._connected = False
+                log.warning("Ingest error: %s", e)
+                next_delay = max(self.retry_backoff_s, self.poll_interval_s)
+            # Wait for either stop or next poll
+            self._stop_event.wait(next_delay)
+        log.info("Ingest loop stopped")
+
+    def get_latest(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if self._latest is None:
+                return None
+            # return a shallow copy to avoid external mutation
+            return dict(self._latest)
 
     def get_status(self) -> Dict[str, Any]:
-        return {
-            "connected": self._connected,
-            "host": self.host,
-            "port": self.port,
-            "uptime_sec": round(self.uptime(), 3),
-            "last_error": self._last_error,
-            "last_sample_ts": self._latest_sample_ts,
-            "total_samples": self._total_samples,
-            "reconnects": self._reconnects,
+        with self._lock:
+            return {
+                'connected': self._connected,
+                'last_update_ts': self._last_update_ts,
+                'samples_count': self._samples_count,
+                'errors_count': self._errors_count,
+                'ingest_thread_alive': self._thread.is_alive() if self._thread else False,
+                'uptime_s': time.monotonic() - self._start_monotonic,
+                'device_state_url': self.state_url,
+                'poll_interval_s': self.poll_interval_s,
+                'timeout_s': self.timeout_s,
+            }
+
+    def move_velocity(self, linear_velocity: float, angular_velocity: float = 0.0) -> Dict[str, Any]:
+        payload = {
+            'linear_velocity': float(linear_velocity),
+            'angular_velocity': float(angular_velocity),
         }
-
-    def get_latest_sample(self) -> Tuple[Optional[Dict[str, Any]], Optional[float], int]:
-        # Returns (sample, ts, seq)
-        return self._latest_sample, self._latest_sample_ts, self._sample_seq
-
-    def send_move(self, direction: str, velocity: float) -> None:
-        if direction not in ("FORWARD", "BACKWARD"):
-            raise ValueError("Invalid direction")
-        line = f"MOVE {direction} {velocity:.3f}\n".encode("utf-8")
-        with self._sock_lock:
-            if not self._sock or not self._connected:
-                raise ConnectionError("Device not connected")
-            try:
-                self._sock.sendall(line)
-                self._logger.info("Sent command: %s", line.decode().strip())
-            except Exception as e:
-                self._last_error = str(e)
-                self._logger.error("Failed to send command: %s", e)
-                raise
-
-    def _run(self) -> None:
-        backoff = self.reconnect_initial_delay_sec
-        while not self._stop_event.is_set():
-            try:
-                self._connect()
-                self._read_loop()
-            except Exception as e:
-                self._last_error = str(e)
-                self._logger.warning("Device connection/read error: %s", e)
-            finally:
-                self._set_connected(False)
-                self._close_sock()
-
-            if self._stop_event.is_set():
-                break
-
-            # Backoff before reconnect
-            self._reconnects += 1
-            delay = min(backoff, self.reconnect_max_delay_sec)
-            self._logger.info("Reconnecting in %.2f sec (attempt %d)", delay, self._reconnects)
-            self._stop_event.wait(delay)
-            backoff = min(backoff * 2.0, self.reconnect_max_delay_sec)
-
-    def _connect(self) -> None:
-        self._logger.info("Connecting to device %s:%d", self.host, self.port)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(self.connect_timeout_sec)
-        s.connect((self.host, self.port))
-        s.settimeout(self.read_timeout_sec)
-        with self._sock_lock:
-            self._sock = s
-        self._set_connected(True)
-        self._logger.info("Connected to device")
-
-        # Optional greeting or sync could be added here if protocol requires
-
-    def _read_loop(self) -> None:
-        buf = bytearray()
-        last_data_time = time.time()
-        while not self._stop_event.is_set():
-            with self._sock_lock:
-                s = self._sock
-            if not s:
-                raise ConnectionError("Socket closed")
-            try:
-                data = s.recv(4096)
-                if not data:
-                    raise ConnectionError("Device closed the connection")
-                buf.extend(data)
-                last_data_time = time.time()
-
-                while True:
-                    nl = buf.find(b"\n")
-                    if nl == -1:
-                        break
-                    line = buf[:nl]
-                    del buf[:nl + 1]
-                    line = line.strip()
-                    if not line:
-                        continue
-                    self._handle_line(line)
-
-            except socket.timeout:
-                # No data within read timeout; we can send a keepalive or just continue
-                now = time.time()
-                # If no data for an extended period, consider it a fault to trigger reconnect
-                if now - last_data_time > max(self.read_timeout_sec * 3.0, 10.0):
-                    raise TimeoutError("No telemetry received for extended period")
-                continue
-            except Exception:
-                raise
-
-    def _handle_line(self, line: bytes) -> None:
         try:
-            text = line.decode("utf-8", errors="replace")
-            sample = json.loads(text)
-        except json.JSONDecodeError:
-            # Non-JSON line; log and ignore
-            self._logger.debug("Ignoring non-JSON line: %s", line[:200])
-            return
-        ts = sample.get("ts", time.time())
-        with self._cond:
-            self._latest_sample = sample
-            self._latest_sample_ts = float(ts)
-            self._total_samples += 1
-            self._sample_seq += 1
-            self._cond.notify_all()
-        self._logger.debug("Ingested sample #%d", self._sample_seq)
-
-    def _set_connected(self, value: bool) -> None:
-        self._connected = value
-        with self._cond:
-            self._cond.notify_all()
-
-    def _close_sock(self) -> None:
-        with self._sock_lock:
-            if self._sock:
-                try:
-                    self._sock.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                try:
-                    self._sock.close()
-                except Exception:
-                    pass
-                self._sock = None
+            resp = self._http_post_json(self.move_url, payload)
+            with self._lock:
+                # Assuming a successful command implies connectivity
+                self._connected = True
+            return {'ok': True, 'sent': payload, 'device_response': resp}
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+            with self._lock:
+                self._errors_count += 1
+                self._connected = False
+            return {'ok': False, 'error': str(e), 'sent': payload}
