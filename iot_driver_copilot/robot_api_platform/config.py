@@ -3,43 +3,58 @@ import os
 from dataclasses import dataclass
 
 
-def _getenv(name: str, default: str):
-    return os.environ.get(name, default)
+def _get_env(name: str, default=None):
+    val = os.getenv(name)
+    return val if val is not None else default
 
 
-def _getenv_float(name: str, default: float) -> float:
+def _get_env_int(name: str, default: int) -> int:
+    val = _get_env(name)
+    if val is None:
+        return default
     try:
-        return float(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
+        return int(val)
+    except ValueError:
         return default
 
 
-def _getenv_int(name: str, default: int) -> int:
+def _get_env_float(name: str, default: float) -> float:
+    val = _get_env(name)
+    if val is None:
+        return default
     try:
-        return int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
+        return float(val)
+    except ValueError:
         return default
 
 
 @dataclass
 class Config:
-    # HTTP server configuration
-    http_host: str = _getenv("HTTP_HOST", "0.0.0.0")
-    http_port: int = _getenv_int("HTTP_PORT", 8080)
+    http_host: str
+    http_port: int
 
-    # Device connectivity
-    device_host: str = _getenv("DEVICE_HOST", "127.0.0.1")
-    device_ctrl_port: int = _getenv_int("DEVICE_CTRL_PORT", 9000)
-    device_tel_port: int = _getenv_int("DEVICE_TEL_PORT", 9001)
+    device_host: str
+    device_port: int
 
-    # Timeouts and retry/backoff
-    connect_timeout: float = _getenv_float("CONNECT_TIMEOUT", 5.0)
-    read_timeout: float = _getenv_float("READ_TIMEOUT", 5.0)
-    reconnect_delay_min: float = _getenv_float("RECONNECT_DELAY_MIN", 0.5)
-    reconnect_delay_max: float = _getenv_float("RECONNECT_DELAY_MAX", 5.0)
+    connect_timeout_sec: float
+    read_timeout_sec: float
+    reconnect_initial_delay_sec: float
+    reconnect_max_delay_sec: float
 
-    # Movement defaults
-    linear_velocity_default: float = _getenv_float("LINEAR_VELOCITY_DEFAULT", 0.2)
+    default_linear_velocity: float
+    sse_keepalive_interval_sec: float
 
-    # Logging
-    log_level: str = _getenv("LOG_LEVEL", "INFO").upper()
+    @staticmethod
+    def load_from_env() -> "Config":
+        return Config(
+            http_host=_get_env("HTTP_HOST", "0.0.0.0"),
+            http_port=_get_env_int("HTTP_PORT", 8000),
+            device_host=_get_env("DEVICE_HOST", "127.0.0.1"),
+            device_port=_get_env_int("DEVICE_PORT", 9000),
+            connect_timeout_sec=_get_env_float("DEVICE_CONNECT_TIMEOUT_SEC", 3.0),
+            read_timeout_sec=_get_env_float("DEVICE_READ_TIMEOUT_SEC", 5.0),
+            reconnect_initial_delay_sec=_get_env_float("DEVICE_RECONNECT_INITIAL_DELAY_SEC", 1.0),
+            reconnect_max_delay_sec=_get_env_float("DEVICE_RECONNECT_MAX_DELAY_SEC", 30.0),
+            default_linear_velocity=_get_env_float("DEFAULT_LINEAR_VELOCITY", 0.5),
+            sse_keepalive_interval_sec=_get_env_float("SSE_KEEPALIVE_INTERVAL_SEC", 15.0),
+        )

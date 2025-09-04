@@ -1,198 +1,213 @@
 # driver.py
 import json
+import logging
 import signal
 import threading
 import time
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 from config import Config
-from util import Logger
-from device_client import RobotClient
+from device_client import DeviceClient
 
 
-START_TIME = time.time()
-CFG = Config()
-LOG = Logger(CFG.log_level)
-CLIENT = RobotClient(CFG, LOG)
-SHUTDOWN = threading.Event()
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
+logger = logging.getLogger("Driver")
 
 
-def _json_bytes(obj) -> bytes:
-    return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "RobotDriver/1.0"
+class RequestHandler(BaseHTTPRequestHandler):
+    # Injected before server starts
+    device: DeviceClient = None  # type: ignore
+    config: Config = None  # type: ignore
+    start_time: float = time.time()
 
-    def _set_common_headers(self, code=200, content_type="application/json"):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        # For SSE streaming, the connection is kept alive by default
+    def log_message(self, format: str, *args):
+        logger.info("%s - %s" % (self.address_string(), format % args))
+
+    def _send_json(self, status: int, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _parse_query(self):
+        o = urlparse(self.path)
+        return o.path, parse_qs(o.query)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip('/') or '/'
-        qs = parse_qs(parsed.query)
-        try:
-            if path == "/status":
-                self._handle_status()
-            elif path == "/snapshot":
-                self._handle_snapshot()
-            elif path == "/stream":
-                self._handle_stream()
-            elif path == "/move/forward":
-                self._handle_move(direction="forward", qs=qs)
-            elif path == "/move/backward":
-                self._handle_move(direction="backward", qs=qs)
-            else:
-                self._set_common_headers(404)
-                self.end_headers()
-                self.wfile.write(_json_bytes({"error": "not found"}))
-        except Exception as e:
-            LOG.error(f"Handler error for {path}: {e}")
-            try:
-                self._set_common_headers(500)
-                self.end_headers()
-                self.wfile.write(_json_bytes({"error": str(e)}))
-            except Exception:
-                pass
+        path, qs = self._parse_query()
+        if path == "/status":
+            self._handle_status()
+            return
+        if path == "/snapshot":
+            self._handle_snapshot()
+            return
+        if path == "/stream":
+            self._handle_stream()
+            return
+        if path == "/move/forward":
+            self._handle_move(direction="FORWARD")
+            return
+        if path == "/move/backward":
+            self._handle_move(direction="BACKWARD")
+            return
 
-    def log_message(self, format, *args):
-        # Route server logs through our logger
-        LOG.info("HTTP " + (format % args))
+        self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
     def _handle_status(self):
-        latest, latest_ts, tel_count, tel_errs, tel_connected, tel_last_err = CLIENT.telemetry_snapshot()
-        ctrl = CLIENT.control_snapshot()
-        body = {
-            "uptime_sec": round(time.time() - START_TIME, 3),
-            "device": {
-                "host": CFG.device_host,
-                "control_port": CFG.device_ctrl_port,
-                "telemetry_port": CFG.device_tel_port,
+        payload = {
+            "driver": {
+                "uptime_sec": round(time.time() - self.start_time, 3),
+                "http_host": self.config.http_host,
+                "http_port": self.config.http_port,
             },
-            "telemetry": {
-                "connected": tel_connected,
-                "samples": tel_count,
-                "errors": tel_errs,
-                "last_error": tel_last_err,
-                "last_sample_ts": latest_ts,
-            },
-            "control": ctrl,
-            "http": {"host": CFG.http_host, "port": CFG.http_port},
-            "now": time.time(),
+            "device": self.device.get_status(),
         }
-        self._set_common_headers(200, "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(_json_bytes(body))
+        self._send_json(HTTPStatus.OK, payload)
 
     def _handle_snapshot(self):
-        latest = CLIENT.latest_telemetry()
-        if latest is None:
-            self._set_common_headers(204, "application/json; charset=utf-8")
-            self.end_headers()
+        sample, ts, seq = self.device.get_latest_sample()
+        if sample is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": "no sample available",
+                "connected": self.device.is_connected(),
+            })
             return
-        self._set_common_headers(200, "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(_json_bytes(latest))
+        payload = {
+            "seq": seq,
+            "ts": ts,
+            "data": sample,
+        }
+        self._send_json(HTTPStatus.OK, payload)
 
     def _handle_stream(self):
-        # Server-Sent Events streaming of telemetry updates
-        q = CLIENT.subscribe()
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.flush()
-
-            last_ping = time.time()
-            while not SHUTDOWN.is_set():
-                try:
-                    # Wait up to 10s for new data
-                    item = q.get(timeout=10.0)
-                    payload = json.dumps(item, separators=(",", ":"))
-                    data = f"event: update\ndata: {payload}\n\n".encode("utf-8")
-                    self.wfile.write(data)
-                    self.wfile.flush()
-                    last_ping = time.time()
-                except Exception:
-                    # Timeout or write error; send a keepalive comment if needed
-                    now = time.time()
-                    if now - last_ping > 15:
-                        try:
-                            self.wfile.write(b": keepalive\n\n")
-                            self.wfile.flush()
-                            last_ping = now
-                        except Exception:
-                            break
-        finally:
-            CLIENT.unsubscribe(q)
-
-    def _handle_move(self, direction: str, qs):
-        # GET parameter: linear_velocity (float)
-        lv = None
-        if "linear_velocity" in qs and qs["linear_velocity"]:
-            try:
-                lv = float(qs["linear_velocity"][0])
-            except ValueError:
-                self._set_common_headers(400)
-                self.end_headers()
-                self.wfile.write(_json_bytes({"error": "invalid linear_velocity"}))
-                return
-        else:
-            lv = CFG.linear_velocity_default
-
-        try:
-            if direction == "forward":
-                resp = CLIENT.move_forward(lv)
-            else:
-                resp = CLIENT.move_backward(lv)
-        except Exception as e:
-            self._set_common_headers(502)
-            self.end_headers()
-            self.wfile.write(_json_bytes({"ok": False, "error": str(e)}))
-            return
-
-        self._set_common_headers(200)
+        # Server-Sent Events streaming of telemetry
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
         self.end_headers()
-        self.wfile.write(_json_bytes({
-            "ok": True,
-            "direction": direction,
-            "linear_velocity": lv,
-            "device_response": resp,
-        }))
+
+        keepalive_interval = max(1.0, float(self.config.sse_keepalive_interval_sec))
+        last_sent_seq = -1
+        last_keepalive = time.time()
+
+        try:
+            while True:
+                # Wait for new sample or timeout for keepalive
+                with self.device._cond:  # Accessing condition for waiting
+                    if self.device._sample_seq == last_sent_seq:
+                        self.device._cond.wait(timeout=1.0)
+                    sample, ts, seq = self.device.get_latest_sample()
+
+                now = time.time()
+                if sample is not None and seq != last_sent_seq:
+                    event = {
+                        "seq": seq,
+                        "ts": ts,
+                        "data": sample,
+                    }
+                    payload = json.dumps(event)
+                    chunk = f"data: {payload}\n\n".encode("utf-8")
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    last_sent_seq = seq
+                    last_keepalive = now
+                elif (now - last_keepalive) >= keepalive_interval:
+                    # Send a comment as keepalive
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except BrokenPipeError:
+                        break
+                    last_keepalive = now
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as e:
+            logger.warning("Stream handler error: %s", e)
+
+    def _handle_move(self, direction: str):
+        # Parse query for linear_velocity
+        _, qs = self._parse_query()
+        vel = None
+        if "linear_velocity" in qs and len(qs["linear_velocity"]) > 0:
+            try:
+                vel = float(qs["linear_velocity"][0])
+            except ValueError:
+                vel = None
+        if vel is None:
+            vel = float(self.config.default_linear_velocity)
+        # Clamp velocity to a safe range [0.0, 1.0]
+        if vel < 0.0:
+            vel = 0.0
+        if vel > 1.0:
+            vel = 1.0
+
+        try:
+            self.device.send_move(direction, vel)
+            self._send_json(HTTPStatus.OK, {
+                "ok": True,
+                "direction": direction.lower(),
+                "linear_velocity": vel,
+            })
+        except ConnectionError:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "ok": False,
+                "error": "device not connected",
+            })
+        except Exception as e:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                "ok": False,
+                "error": str(e),
+            })
 
 
-def _graceful_shutdown(signum, frame):
-    LOG.warn(f"Received signal {signum}, shutting down...")
-    SHUTDOWN.set()
+def main():
+    cfg = Config.load_from_env()
+
+    device = DeviceClient(
+        host=cfg.device_host,
+        port=cfg.device_port,
+        connect_timeout_sec=cfg.connect_timeout_sec,
+        read_timeout_sec=cfg.read_timeout_sec,
+        reconnect_initial_delay_sec=cfg.reconnect_initial_delay_sec,
+        reconnect_max_delay_sec=cfg.reconnect_max_delay_sec,
+    )
+    device.start()
+
+    RequestHandler.device = device
+    RequestHandler.config = cfg
+
+    httpd = ThreadingHTTPServer((cfg.http_host, cfg.http_port), RequestHandler)
+
+    shutdown_event = threading.Event()
+
+    def handle_signal(signum, frame):
+        logger.info("Received signal %s, shutting down...", signum)
+        shutdown_event.set()
+        # server.shutdown() is safe to call from another thread
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    logger.info("HTTP server listening on %s:%d", cfg.http_host, cfg.http_port)
     try:
-        httpd.shutdown()
-    except Exception:
-        pass
-    CLIENT.stop()
+        httpd.serve_forever()
+    finally:
+        device.stop()
+        httpd.server_close()
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
-    CLIENT.start()
-
-    server_address = (CFG.http_host, CFG.http_port)
-    httpd = ThreadingHTTPServer(server_address, Handler)
-
-    signal.signal(signal.SIGINT, _graceful_shutdown)
-    signal.signal(signal.SIGTERM, _graceful_shutdown)
-
-    LOG.info(f"HTTP server listening on http://{CFG.http_host}:{CFG.http_port}")
-    try:
-        httpd.serve_forever(poll_interval=0.5)
-    finally:
-        CLIENT.stop()
-        LOG.info("HTTP server stopped")
+    main()
