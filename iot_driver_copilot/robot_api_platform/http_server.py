@@ -1,166 +1,149 @@
 # http_server.py
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import urllib.parse
-import time
+import logging
 import threading
-from typing import Tuple
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
+from config import Config
 from device_client import DeviceClient
-from stream_hub import SSEHub
+from state import DriverState
+
+logger = logging.getLogger(__name__)
+
+# Globals set by driver.py
+CFG: Config = None  # type: ignore
+CLIENT: DeviceClient = None  # type: ignore
+STATE: DriverState = None  # type: ignore
+SHUTDOWN_EVENT: threading.Event = None  # type: ignore
 
 
-class DriverHTTPHandler(BaseHTTPRequestHandler):
-    # Will be set by server bootstrap
-    device: DeviceClient = None  # type: ignore
-    hub: SSEHub = None  # type: ignore
-    default_linear_velocity: float = 0.2
+def _send_json(handler: BaseHTTPRequestHandler, obj: dict, status: int = 200):
+    body = json.dumps(obj).encode('utf-8')
+    handler.send_response(status)
+    handler.send_header('Content-Type', 'application/json')
+    handler.send_header('Content-Length', str(len(body)))
+    handler.send_header('Cache-Control', 'no-store')
+    handler.end_headers()
+    handler.wfile.write(body)
 
-    server_version = "RobotDriverHTTP/1.0"
 
-    def log_message(self, format: str, *args):
+def _bad_request(handler: BaseHTTPRequestHandler, msg: str):
+    _send_json(handler, {"error": msg}, status=400)
+
+
+class DriverHandler(BaseHTTPRequestHandler):
+    server_version = 'RobotCarDriver/1.0'
+
+    def log_message(self, format, *args):  # noqa: A003 - override
+        logger.info("%s - - %s", self.address_string(), format % args)
+
+    def do_GET(self):  # noqa: N802 - required by BaseHTTPRequestHandler
         try:
-            msg = "%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), format % args)
-            self.server.log_lock.acquire()
-            try:
-                self.server.log_stream.write(msg)
-                self.server.log_stream.flush()
-            finally:
-                self.server.log_lock.release()
-        except Exception:
-            pass
-
-    def _send_json(self, obj, status: int = 200) -> None:
-        data = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _parse_query(self):
-        parts = urllib.parse.urlsplit(self.path)
-        return parts.path, urllib.parse.parse_qs(parts.query)
-
-    def do_GET(self):
-        path, qs = self._parse_query()
-        if path == "/status":
-            self.handle_status()
-        elif path == "/snapshot":
-            self.handle_snapshot()
-        elif path == "/stream":
-            self.handle_stream()
-        elif path == "/move/forward":
-            self.handle_move(direction="FORWARD", qs=qs)
-        elif path == "/move/backward":
-            self.handle_move(direction="BACKWARD", qs=qs)
-        else:
-            self.send_error(404, "Not Found")
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == '/status':
+                return self.handle_status()
+            if path == '/snapshot':
+                return self.handle_snapshot()
+            if path == '/stream':
+                return self.handle_stream(parsed)
+            if path == '/move/forward':
+                return self.handle_move('forward', parsed)
+            if path == '/move/backward':
+                return self.handle_move('backward', parsed)
+            # Not found
+            _send_json(self, {"error": "not found"}, status=404)
+        except Exception as e:  # noqa: BLE001
+            logger.exception('Handler error: %s', e)
+            _send_json(self, {"error": str(e)}, status=500)
 
     def handle_status(self):
-        stats = self.device.get_stats()
-        latest = self.device.get_latest()
-        resp = {
-            "connected": stats.get("connected", False),
-            "uptime_sec": stats.get("uptime_sec", 0.0),
-            "last_telemetry_ts": stats.get("last_telemetry_ts"),
-            "samples_received": stats.get("samples_received", 0),
-            "bytes_received": stats.get("bytes_received", 0),
-            "last_error": stats.get("last_error"),
-            "latest_keys": list(latest.keys()) if latest else [],
-        }
-        self._send_json(resp)
+        snap = STATE.snapshot()
+        _send_json(self, {
+            "ok": True,
+            "state": snap,
+        })
 
     def handle_snapshot(self):
-        latest = self.device.get_latest()
-        if latest is None:
-            self._send_json({"error": "no data yet"}, status=503)
-            return
-        self._send_json(latest)
+        snap = STATE.snapshot()
+        _send_json(self, snap)
 
-    def handle_stream(self):
+    def handle_stream(self, parsed):
+        qs = parse_qs(parsed.query or '')
+        try:
+            interval_ms = int(qs.get('interval_ms', [str(CFG.stream_interval_ms)])[0])
+        except ValueError:
+            interval_ms = CFG.stream_interval_ms
+        if interval_ms < 100:
+            interval_ms = 100
+        # Prepare SSE headers
         self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        client = self.hub.subscribe()
-        # Send initial comment to establish SSE
+        # Stream loop
         try:
-            self.wfile.write(b": connected\n\n")
-            self.wfile.flush()
-        except Exception:
-            self.hub.unsubscribe(client)
-            return
-        # Push last known snapshot immediately if any
-        latest = self.device.get_latest()
-        if latest is not None:
-            try:
-                payload = json.dumps(latest).encode("utf-8")
-                self.wfile.write(b"data: "+payload+b"\n\n")
+            while not SHUTDOWN_EVENT.is_set():
+                data = json.dumps(STATE.snapshot())
+                chunk = f"event: snapshot\n" f"data: {data}\n\n"
+                self.wfile.write(chunk.encode('utf-8'))
                 self.wfile.flush()
-            except Exception:
-                self.hub.unsubscribe(client)
-                return
-        # Loop forwarding hub messages
-        try:
-            import queue as _q
-            while True:
-                try:
-                    item = client.queue.get(timeout=15.0)
-                except _q.Empty:
-                    # heartbeat
-                    try:
-                        self.wfile.write(b": keep-alive\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        break
-                    continue
-                if item == "__CLOSE__":
-                    break
-                try:
-                    if item:
-                        payload = item.encode("utf-8")
-                        self.wfile.write(b"data: "+payload+b"\n\n")
-                    else:
-                        self.wfile.write(b": keep-alive\n\n")
-                    self.wfile.flush()
-                except Exception:
-                    break
-        finally:
-            self.hub.unsubscribe(client)
+                time.sleep(interval_ms / 1000.0)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info('Client disconnected from /stream')
+        except Exception as e:  # noqa: BLE001
+            logger.warning('Stream error: %s', e)
 
-    def handle_move(self, direction: str, qs):
-        lv = None
+    def handle_move(self, direction: str, parsed):
+        qs = parse_qs(parsed.query or '')
+        if 'linear_velocity' not in qs:
+            return _bad_request(self, 'missing linear_velocity')
         try:
-            if "linear_velocity" in qs and len(qs["linear_velocity"]) > 0:
-                lv = float(qs["linear_velocity"][0])
-        except Exception:
-            lv = None
-        if lv is None:
-            lv = self.default_linear_velocity
-        # Clamp to a sane range
-        if direction == "FORWARD":
-            lv = max(0.0, min(lv, 3.0))
-        else:
-            lv = max(0.0, min(lv, 3.0))
-        vel = lv if direction == "FORWARD" else -lv
-        ok = self.device.send_move(direction=direction, linear_velocity=abs(vel))
-        status = 200 if ok else 503
-        resp = {
-            "ok": ok,
-            "direction": direction.lower(),
-            "linear_velocity": vel,
-            "connected": self.device.is_connected(),
-            "ts": time.time(),
-        }
-        self._send_json(resp, status=status)
+            lv = float(qs['linear_velocity'][0])
+        except ValueError:
+            return _bad_request(self, 'linear_velocity must be float')
+        if lv < 0:
+            return _bad_request(self, 'linear_velocity must be >= 0')
+
+        STATE.record_command(f'move_{direction}', {"linear_velocity": lv})
+        # Call device native API via DeviceClient
+        try:
+            if direction == 'forward':
+                status, body, rtt = CLIENT.move_forward(lv)
+            else:
+                status, body, rtt = CLIENT.move_backward(lv)
+            ok = 200 <= status < 300
+            snippet = body.decode('utf-8', errors='ignore')[:512] if body else ''
+            STATE.record_command_result(status, snippet, rtt, ok)
+            if ok:
+                STATE.set_motion(direction, lv)
+            resp = {
+                "ok": ok,
+                "device_status": status,
+                "device_rtt_ms": rtt,
+                "device_response_snippet": snippet,
+                "motion": STATE.snapshot().get('motion'),
+            }
+            _send_json(self, resp, status=200 if ok else 502)
+        except Exception as e:  # noqa: BLE001
+            STATE.record_command_result(0, str(e)[:512], 0.0, False)
+            _send_json(self, {"ok": False, "error": str(e)}, status=502)
 
 
 class DriverHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address: Tuple[str, int], RequestHandlerClass, bind_and_activate: bool = True):
-        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
-        self.log_lock = threading.Lock()
-        import sys
-        self.log_stream = sys.stderr
+    daemon_threads = True
+
+
+def create_server(cfg: Config, client: DeviceClient, state: DriverState, shutdown_event: threading.Event) -> DriverHTTPServer:
+    global CFG, CLIENT, STATE, SHUTDOWN_EVENT
+    CFG = cfg
+    CLIENT = client
+    STATE = state
+    SHUTDOWN_EVENT = shutdown_event
+
+    server = DriverHTTPServer((cfg.http_host, cfg.http_port), DriverHandler)
+    return server

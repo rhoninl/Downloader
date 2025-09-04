@@ -1,211 +1,96 @@
 # device_client.py
-import socket
-import threading
-import time
+import base64
 import json
-import random
-from typing import Optional, Dict, Any
+import time
+import logging
+import socket
+from http.client import HTTPConnection, HTTPSConnection, ResponseException
+from urllib.parse import urlencode
+from typing import Optional, Tuple
 
+from config import Config
+
+logger = logging.getLogger(__name__)
 
 class DeviceClient:
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        connect_timeout: float = 5.0,
-        read_timeout: float = 5.0,
-        reconnect_backoff: float = 1.0,
-        max_backoff: float = 30.0,
-    ) -> None:
-        self.host = host
-        self.port = port
-        self.connect_timeout = connect_timeout
-        self.read_timeout = read_timeout
-        self.reconnect_backoff = reconnect_backoff
-        self.max_backoff = max_backoff
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._auth_header = None
+        if cfg.device_username is not None and cfg.device_password is not None:
+            token = f"{cfg.device_username}:{cfg.device_password}".encode('utf-8')
+            self._auth_header = 'Basic ' + base64.b64encode(token).decode('ascii')
 
-        self._sock: Optional[socket.socket] = None
-        self._sock_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="DeviceClientLoop", daemon=True)
+    def _conn(self):
+        if self.cfg.device_scheme == 'https':
+            return HTTPSConnection(self.cfg.device_host, self.cfg.device_port, timeout=self.cfg.request_timeout_sec)
+        else:
+            return HTTPConnection(self.cfg.device_host, self.cfg.device_port, timeout=self.cfg.request_timeout_sec)
 
-        self._latest_sample: Optional[Dict[str, Any]] = None
-        self._latest_lock = threading.Lock()
+    def send_get(self, path: str, params: Optional[dict] = None) -> Tuple[int, bytes, float]:
+        attempts = 0
+        backoff = self.cfg.retry_backoff_ms / 1000.0
+        last_exc = None
+        while attempts < self.cfg.retry_max_attempts:
+            attempts += 1
+            try:
+                full_path = self.cfg.join_device_path(path)
+                if params:
+                    query = urlencode(params, doseq=True)
+                    if '?' in full_path:
+                        full_path = full_path + '&' + query
+                    else:
+                        full_path = full_path + '?' + query
+                conn = self._conn()
+                headers = {}
+                if self._auth_header:
+                    headers['Authorization'] = self._auth_header
+                start = time.monotonic()
+                conn.request('GET', full_path, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read()
+                rtt = (time.monotonic() - start) * 1000.0
+                status = resp.status
+                conn.close()
+                logger.info('Device GET %s -> %s in %.1fms', full_path, status, rtt)
+                return status, body, rtt
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                logger.warning('Device GET attempt %d failed: %s', attempts, e)
+                time.sleep(backoff)
+                backoff *= 2
+        # After retries
+        raise RuntimeError(f'Device GET failed after {self.cfg.retry_max_attempts} attempts: {last_exc}')
 
-        self._connected = False
-        self._connected_lock = threading.Lock()
-
-        self._stats_lock = threading.Lock()
-        self._samples_received = 0
-        self._bytes_received = 0
-        self._last_error: Optional[str] = None
-        self._last_telemetry_ts: Optional[float] = None
-        self._start_time = time.time()
-
-    def start(self) -> None:
-        self._stop_event.clear()
-        if not self._thread.is_alive():
-            self._thread = threading.Thread(target=self._run, name="DeviceClientLoop", daemon=True)
-            self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
+    def head_root(self) -> Tuple[bool, Optional[int], float, Optional[str]]:
+        # Perform a HEAD / to validate HTTP service and measure RTT
         try:
-            with self._sock_lock:
-                if self._sock:
-                    try:
-                        self._sock.shutdown(socket.SHUT_RDWR)
-                    except Exception:
-                        pass
-                    try:
-                        self._sock.close()
-                    except Exception:
-                        pass
-                    self._sock = None
-        except Exception:
-            pass
-        if self._thread.is_alive():
-            self._thread.join(timeout=5.0)
+            conn = self._conn()
+            start = time.monotonic()
+            conn.request('HEAD', self.cfg.join_device_path('/') if self.cfg.device_base_path else '/')
+            resp = conn.getresponse()
+            # Reading body is not necessary for HEAD but ensure release
+            _ = resp.read()
+            rtt = (time.monotonic() - start) * 1000.0
+            status = resp.status
+            conn.close()
+            logger.debug('Device HEAD / -> %s in %.1fms', status, rtt)
+            return True, status, rtt, None
+        except Exception as e:  # noqa: BLE001
+            logger.debug('Device HEAD failed: %s', e)
+            return False, None, 0.0, str(e)
 
-    def is_connected(self) -> bool:
-        with self._connected_lock:
-            return self._connected
-
-    def _set_connected(self, val: bool) -> None:
-        with self._connected_lock:
-            self._connected = val
-
-    def get_latest(self) -> Optional[Dict[str, Any]]:
-        with self._latest_lock:
-            return dict(self._latest_sample) if self._latest_sample is not None else None
-
-    def get_stats(self) -> Dict[str, Any]:
-        with self._stats_lock:
-            stats = {
-                "samples_received": self._samples_received,
-                "bytes_received": self._bytes_received,
-                "last_error": self._last_error,
-                "last_telemetry_ts": self._last_telemetry_ts,
-                "uptime_sec": time.time() - self._start_time,
-            }
-        stats["connected"] = self.is_connected()
-        return stats
-
-    def send_move(self, direction: str, linear_velocity: float) -> bool:
-        # direction: 'FORWARD' or 'BACKWARD'
-        cmd = f"CMD MOVE {direction} v={linear_velocity:.3f}\n"
-        data = cmd.encode("utf-8")
-        with self._sock_lock:
-            if not self._sock:
-                self._set_last_error("not connected")
-                return False
-            try:
-                self._sock.sendall(data)
-                return True
-            except Exception as e:
-                self._set_last_error(f"send_move failed: {e}")
-                try:
-                    self._sock.close()
-                except Exception:
-                    pass
-                self._sock = None
-                self._set_connected(False)
-                return False
-
-    def _set_last_error(self, err: str) -> None:
-        with self._stats_lock:
-            self._last_error = err
-
-    def _run(self) -> None:
-        backoff = self.reconnect_backoff
-        while not self._stop_event.is_set():
-            try:
-                sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
-                sock.settimeout(self.read_timeout)
-                with self._sock_lock:
-                    self._sock = sock
-                self._set_connected(True)
-                backoff = self.reconnect_backoff
-                self._read_loop(sock)
-            except Exception as e:
-                self._set_last_error(str(e))
-                self._set_connected(False)
-                with self._sock_lock:
-                    if self._sock:
-                        try:
-                            self._sock.close()
-                        except Exception:
-                            pass
-                        self._sock = None
-                if self._stop_event.is_set():
-                    break
-                sleep_time = min(self.max_backoff, backoff * (1.0 + random.random()))
-                time.sleep(sleep_time)
-                backoff = min(self.max_backoff, backoff * 2)
-
-    def _read_loop(self, sock: socket.socket) -> None:
-        # Use buffered file for line-based reading
-        f = sock.makefile("r", encoding="utf-8", newline="\n")
+    def port_reachable(self) -> Tuple[bool, float, Optional[str]]:
+        # Lightweight TCP connect test
+        start = time.monotonic()
         try:
-            while not self._stop_event.is_set():
-                line = f.readline()
-                if not line:
-                    raise ConnectionError("device closed connection")
-                self._on_line(line)
-        finally:
-            try:
-                f.close()
-            except Exception:
-                pass
-            try:
-                sock.close()
-            except Exception:
-                pass
+            with socket.create_connection((self.cfg.device_host, self.cfg.device_port), timeout=self.cfg.request_timeout_sec):
+                rtt = (time.monotonic() - start) * 1000.0
+                return True, rtt, None
+        except Exception as e:  # noqa: BLE001
+            return False, 0.0, str(e)
 
-    def _on_line(self, line: str) -> None:
-        ts = time.time()
-        b = len(line.encode("utf-8", errors="ignore"))
-        with self._stats_lock:
-            self._bytes_received += b
-        line = line.strip()
-        if not line:
-            return
-        sample: Optional[Dict[str, Any]] = None
-        # Try parse as JSON first
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict):
-                sample = obj
-        except Exception:
-            pass
-        if sample is None:
-            # Try parse key=value pairs separated by commas or spaces
-            parts = [p for seg in line.split(",") for p in seg.strip().split()]
-            kv: Dict[str, Any] = {}
-            for part in parts:
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    k = k.strip()
-                    v = v.strip()
-                    # Try convert to number
-                    try:
-                        if v.lower() in ("true", "false"):
-                            val: Any = v.lower() == "true"
-                        elif "." in v or "e" in v.lower():
-                            val = float(v)
-                        else:
-                            val = int(v)
-                    except Exception:
-                        val = v
-                    kv[k] = val
-            if kv:
-                sample = kv
-        if sample is None:
-            # Last resort wrap raw line
-            sample = {"raw": line}
-        sample["ts"] = ts
-        with self._latest_lock:
-            self._latest_sample = sample
-        with self._stats_lock:
-            self._samples_received += 1
-            self._last_telemetry_ts = ts
+    def move_forward(self, linear_velocity: float) -> Tuple[int, bytes, float]:
+        return self.send_get('/move/forward', {'linear_velocity': linear_velocity})
+
+    def move_backward(self, linear_velocity: float) -> Tuple[int, bytes, float]:
+        return self.send_get('/move/backward', {'linear_velocity': linear_velocity})
