@@ -1,98 +1,64 @@
-ESL Driver (Telpo ESL HTTP to HTTP proxy)
+ESL Driver (Telpo ESL Controller)
 
-This driver exposes a minimal HTTP interface and converts requests into the device's native HTTP API calls. It logs in to the device, manages token refresh, retries on failures with exponential backoff, and provides two endpoints:
+Overview
+- This driver provides a small HTTP service that logs into a Telpo ESL controller, maintains the session token with automatic retries, and forwards specific commands to the device API. It converts your requests into the device’s native HTTP API, handling token management, retries, and timeouts.
+- Implemented endpoints (only these):
+  - POST /esl/flush
+  - PUT /esl/data
 
-- PUT /update: Update product data used by ESL templates
-- POST /refresh: Trigger a specific ESL to refresh its display
+Environment Variables
+- HTTP_HOST: Interface to bind the HTTP server. Default: 0.0.0.0
+- HTTP_PORT: Port to bind the HTTP server. Default: 8000
+- DEVICE_BASE_URL: Base URL of the ESL controller (e.g., http://192.168.2.97). Required
+- DEVICE_USERNAME: ESL controller username. Required
+- DEVICE_PASSWORD_MD5: ESL controller password in MD5 hex format. Required
+- REQUEST_TIMEOUT: Per-request timeout to the device in seconds. Default: 5
+- RETRY_MAX: Maximum backoff exponent used by the token manager. Default: 5
+- RETRY_BASE_DELAY_MS: Base delay (ms) for exponential backoff on login failures. Default: 500
+- RETRY_MAX_DELAY_MS: Maximum backoff delay (ms). Default: 8000
+- TOKEN_REFRESH_INTERVAL_SEC: Periodic login refresh interval in seconds. Default: 300
+- REQUEST_TOKEN_WAIT_SEC: How long a request waits for a token if not yet available. Default: 5
+- DEVICE_TLS_VERIFY: Verify TLS certificates when DEVICE_BASE_URL uses https. Default: true
+- LOG_LEVEL: Logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
 
-The driver runs its own HTTP server and does not expose or redirect to the device's native URLs.
-
-Environment variables
-
-- HTTP_HOST: Host/IP to bind the HTTP server (default: 0.0.0.0)
-- HTTP_PORT: Port to bind the HTTP server (default: 8080)
-- AUTH_TOKEN: Bearer token required by clients to access this driver (required)
-- DEVICE_BASE_URL: Base URL of the ESL device (e.g., http://192.168.2.97) (required)
-- DEVICE_USERNAME: Username for device login (required)
-- DEVICE_PASSWORD_MD5: Password MD5 hash for device login (required)
-- DEVICE_TIMEOUT_SEC: Timeout in seconds for device requests (default: 5)
-- DEVICE_RETRY_MAX: Max retries for device requests and login (default: 5)
-- DEVICE_BACKOFF_INITIAL_MS: Initial backoff in milliseconds (default: 500)
-- DEVICE_BACKOFF_MAX_MS: Maximum backoff in milliseconds (default: 8000)
-- DEVICE_LOGIN_REFRESH_SEC: Periodic re-login interval in seconds (default: 300)
+How It Works
+- On startup, the driver launches a background token manager that logs into the ESL controller at /api/login using DEVICE_USERNAME and DEVICE_PASSWORD_MD5, then refreshes the token periodically and with exponential backoff on failures.
+- When you call the driver APIs, it injects the maintained token and forwards the request to the controller. If an auth error occurs, it forces a relogin and retries once.
 
 Run
+- Ensure Python 3.9+ is installed.
+- Set required environment variables and start the driver:
 
-1) Set environment variables and start the driver:
+  DEVICE_BASE_URL=http://192.168.2.97 \
+  DEVICE_USERNAME=admin \
+  DEVICE_PASSWORD_MD5=0192023a7bbd73250516f069df18b500 \
+  python3 driver.py
 
-HTTP_HOST=0.0.0.0 \
-HTTP_PORT=8080 \
-AUTH_TOKEN=changeme-client-token \
-DEVICE_BASE_URL=http://192.168.2.97 \
-DEVICE_USERNAME=admin \
-DEVICE_PASSWORD_MD5=0192023a7bbd73250516f069df18b500 \
-python3 driver.py
+APIs
+1) POST /esl/flush
+- Purpose: Trigger a flush/refresh on a specific ESL tag.
+- Body (JSON): { "tag": "07000000002b" }
+- Example:
 
-2) Use the APIs (Authorization: Bearer AUTH_TOKEN)
+  curl -X POST http://localhost:8000/esl/flush \
+    -H 'Content-Type: application/json' \
+    -d '{"tag":"07000000002b"}'
 
-- Update product data (maps to device /api/esl/productalert):
+- Internally mapped to device endpoint: POST {DEVICE_BASE_URL}/api/esl/eslflush
 
-curl -X PUT 'http://localhost:8080/update' \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer changeme-client-token' \
-  --data-raw '{
-    "id":"106",
-    "name":"dmall测试商品",
-    "code":"20241129",
-    "upc1":"",
-    "upc2":"",
-    "upc3":"",
-    "upc4":"",
-    "F_01":"777.0",
-    "F_02":"",
-    "F_03":"",
-    "F_04":"500L",
-    "F_05":"",
-    "F_06":"北京",
-    "F_07":"",
-    "F_08":"",
-    "F_09":"",
-    "F_10":"",
-    "F_11":"",
-    "F_12":"",
-    "F_13":"",
-    "F_14":"",
-    "F_15":"",
-    "F_16":"",
-    "F_17":"",
-    "F_18":"",
-    "F_19":"",
-    "F_20":"",
-    "F_21":"",
-    "F_22":"",
-    "F_23":"",
-    "F_24":"",
-    "F_25":"",
-    "F_26":"",
-    "F_27":"",
-    "F_28":"",
-    "F_29":"",
-    "F_30":"",
-    "F_31":"",
-    "F_32":"",
-    "templ":"ddshoptest"
-  }'
+2) PUT /esl/data
+- Purpose: Update the ESL product/template data on the controller.
+- Body (JSON): Include fields supported by the device, e.g. id, name, code, upc1, upc2, upc3, upc4, F_01..F_32, templ.
+- Example:
 
-- Refresh a specific ESL (maps to device /api/esl/eslflush):
+  curl -X PUT http://localhost:8000/esl/data \
+    -H 'Content-Type: application/json' \
+    -d '{"id":"106","name":"dmall测试商品","code":"20241129","upc1":"","upc2":"","upc3":"","upc4":"","F_01":"777.0","F_04":"500L","F_06":"北京","templ":"ddshoptest"}'
 
-curl -X POST 'http://localhost:8080/refresh' \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer changeme-client-token' \
-  --data-raw '{"tag": "07000000002b"}'
+- Internally mapped to device endpoint: POST {DEVICE_BASE_URL}/api/esl/productalert
 
 Notes
-
-- The driver maintains a background login refresher. If the device token expires or the device restarts, the driver will re-login with exponential backoff and retry requests up to DEVICE_RETRY_MAX times.
-- All configuration comes from environment variables. The driver uses only Python standard libraries (no external commands or dependencies).
+- The driver does not expose any device-native URLs; it proxies only the two required endpoints while managing login tokens, retries, and timeouts.
+- If login is not yet successful when an API is called, the driver waits up to REQUEST_TOKEN_WAIT_SEC for a token, otherwise it returns a 503 error.
 
 Generated by [IoT Driver Copilot](https://copilot.test.shifu.dev/)
