@@ -1,355 +1,324 @@
+#!/usr/bin/env python3
 import json
 import logging
+import os
 import signal
 import sys
 import threading
 import time
-import hashlib
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from typing import Optional, Dict, Any
-from urllib import request, error
-from urllib.parse import urljoin
-
-from config import config
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
 
 
-logging.basicConfig(
-    level=config.log_level,
-    format='%(asctime)s %(levelname)s %(threadName)s %(message)s',
-)
-logger = logging.getLogger(__name__)
+# Configuration
+class Config:
+    def __init__(self):
+        self.http_host = os.getenv("HTTP_HOST", "0.0.0.0")
+        self.http_port = int(os.getenv("HTTP_PORT", "8000"))
+
+        base_url = os.getenv("DEVICE_BASE_URL")
+        if not base_url:
+            print("ERROR: DEVICE_BASE_URL must be set", file=sys.stderr)
+            sys.exit(2)
+        self.device_base_url = base_url.rstrip("/")
+
+        self.username = os.getenv("ESL_USERNAME")
+        self.password_md5 = os.getenv("ESL_PASSWORD_MD5")
+        if not self.username or not self.password_md5:
+            print("ERROR: ESL_USERNAME and ESL_PASSWORD_MD5 must be set", file=sys.stderr)
+            sys.exit(2)
+
+        self.device_timeout = float(os.getenv("DEVICE_TIMEOUT_SECONDS", "5"))
+        self.retry_max = int(os.getenv("DEVICE_RETRY_MAX", "3"))
+        self.backoff_base = float(os.getenv("DEVICE_BACKOFF_BASE", "0.5"))
+        self.backoff_max = float(os.getenv("DEVICE_BACKOFF_MAX", "5.0"))
+        self.token_refresh = float(os.getenv("TOKEN_REFRESH_SECONDS", "600"))
+
+        log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        logging.basicConfig(
+            level=getattr(logging, log_level, logging.INFO),
+            format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+        )
 
 
-class DeviceState:
-    def __init__(self) -> None:
+class TokenManager:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._token = None
+        self._session = None
+        self._last_login = 0.0
         self._lock = threading.RLock()
-        self.token: Optional[str] = None
-        self.session: Optional[int] = None
-        self.last_login_ts: Optional[float] = None
-        self.last_login_error: Optional[str] = None
-        self.last_update_ts: Optional[float] = None
-        # Buffers for latest requests/responses
-        self.last_flush_req: Optional[Dict[str, Any]] = None
-        self.last_flush_resp: Optional[Dict[str, Any]] = None
-        self.last_data_req: Optional[Dict[str, Any]] = None
-        self.last_data_resp: Optional[Dict[str, Any]] = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="TokenManager", daemon=False)
 
-    def set_token(self, token: Optional[str], session: Optional[int]) -> None:
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    def get_token(self):
         with self._lock:
-            self.token = token
-            self.session = session
-            self.last_login_ts = time.time() if token else None
+            return self._token
 
-    def set_login_error(self, err: Optional[str]) -> None:
+    def _run(self):
+        backoff = self.cfg.backoff_base
+        while not self._stop.is_set():
+            now = time.time()
+            needs_login = (self._token is None) or (now - self._last_login > self.cfg.token_refresh)
+            if not needs_login:
+                # Sleep until next refresh or stop
+                wait = max(1.0, min(self.cfg.token_refresh - (now - self._last_login), 5.0))
+                self._stop.wait(wait)
+                continue
+
+            try:
+                if self._login_once():
+                    logging.info("Logged into device; session refreshed")
+                    backoff = self.cfg.backoff_base
+                    # Sleep a little to avoid hot loop
+                    self._stop.wait(1.0)
+                else:
+                    raise RuntimeError("Login returned non-zero code")
+            except Exception as e:
+                logging.error("Login failed: %s", e)
+                # Exponential backoff
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2.0, self.cfg.backoff_max)
+
+    def force_refresh(self):
         with self._lock:
-            self.last_login_error = err
+            self._token = None
+        # Wake the loop to refresh immediately
+        return True
 
-    def set_last_update(self) -> None:
-        with self._lock:
-            self.last_update_ts = time.time()
-
-    def set_last_flush(self, req: Dict[str, Any], resp: Optional[Dict[str, Any]]) -> None:
-        with self._lock:
-            self.last_flush_req = req
-            self.last_flush_resp = resp
-
-    def set_last_data(self, req: Dict[str, Any], resp: Optional[Dict[str, Any]]) -> None:
-        with self._lock:
-            self.last_data_req = req
-            self.last_data_resp = resp
-
-    def get_token(self) -> Optional[str]:
-        with self._lock:
-            return self.token
-
-
-STATE = DeviceState()
-STOP_EVENT = threading.Event()
+    def _login_once(self) -> bool:
+        body = json.dumps({"username": self.cfg.username, "password": self.cfg.password_md5}).encode("utf-8")
+        url = f"{self.cfg.device_base_url}/api/login"
+        req = urlrequest.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json;charset=UTF-8")
+        logging.info("Attempting login to device")
+        with urlrequest.urlopen(req, timeout=self.cfg.device_timeout) as resp:
+            resp_body = resp.read()
+            payload = json.loads(resp_body.decode("utf-8") if resp_body else "{}")
+            if payload.get("code") == 0:
+                with self._lock:
+                    self._token = payload.get("token")
+                    self._session = payload.get("session")
+                    self._last_login = time.time()
+                logging.info("Login success; session=%s; last_login=%s", str(self._session), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._last_login)))
+                return True
+            else:
+                logging.warning("Login returned code=%s message=%s", payload.get("code"), payload.get("message"))
+                return False
 
 
 class DeviceClient:
-    def __init__(self, base_url: str, timeout: float) -> None:
-        self.base_url = base_url.rstrip('/')
-        self.timeout = timeout
+    def __init__(self, cfg: Config, tokens: TokenManager):
+        self.cfg = cfg
+        self.tokens = tokens
+        self._last_update_lock = threading.RLock()
+        self.last_update_ts = None
+        self.last_update_type = None  # 'flush' or 'data'
 
-    def _http_json(self, method: str, path: str, body: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        url = self.base_url + path
-        data_bytes = None
-        if body is not None:
-            data_bytes = json.dumps(body).encode('utf-8')
-        req = request.Request(url=url, data=data_bytes, method=method)
-        req.add_header('Content-Type', 'application/json;charset=UTF-8')
-        if headers:
-            for k, v in headers.items():
-                req.add_header(k, v)
-        try:
-            with request.urlopen(req, timeout=self.timeout) as resp:
-                charset = resp.headers.get_content_charset() or 'utf-8'
-                resp_bytes = resp.read()
-                text = resp_bytes.decode(charset, errors='replace')
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    logger.error('Non-JSON response from device: %s', text[:200])
-                    raise
-        except error.HTTPError as e:
-            msg = e.read().decode('utf-8', errors='replace')
-            logger.error('Device HTTPError %s %s: %s', e.code, url, msg)
-            raise
-        except error.URLError as e:
-            logger.error('Device URLError %s: %s', url, getattr(e, 'reason', e))
-            raise
+    def _update_marker(self, typ: str):
+        with self._last_update_lock:
+            self.last_update_ts = time.time()
+            self.last_update_type = typ
+            logging.info("Last device update: type=%s at=%s", typ, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.last_update_ts)))
 
-    def login(self, username: str, password_md5: str) -> Dict[str, Any]:
-        payload = {"username": username, "password": password_md5}
-        logger.info('Attempting device login for user=%s', username)
-        return self._http_json('POST', '/api/login', body=payload)
+    def call_device(self, path: str, method: str, json_body: dict, incoming_token: str = None, op_type: str = "op"):
+        url = f"{self.cfg.device_base_url}{path}"
+        payload = json.dumps(json_body).encode("utf-8")
 
-    def product_alert(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        headers = {"token": token}
-        return self._http_json('POST', '/api/esl/productalert', body=payload, headers=headers)
+        attempt = 0
+        backoff = self.cfg.backoff_base
+        last_exc = None
 
-    def esl_flush(self, token: str, tag: str) -> Dict[str, Any]:
-        headers = {"token": token}
-        payload = {"tag": tag}
-        return self._http_json('POST', '/api/esl/eslflush', body=payload, headers=headers)
+        while attempt < self.cfg.retry_max:
+            attempt += 1
+            token = incoming_token or self.tokens.get_token()
+            req = urlrequest.Request(url, data=payload, method=method)
+            req.add_header("Content-Type", "application/json;charset=UTF-8")
+            if token:
+                req.add_header("token", token)
 
+            try:
+                with urlrequest.urlopen(req, timeout=self.cfg.device_timeout) as resp:
+                    body_bytes = resp.read()
+                    text = body_bytes.decode("utf-8") if body_bytes else "{}"
+                    try:
+                        body_json = json.loads(text)
+                    except json.JSONDecodeError:
+                        body_json = {"raw": text}
 
-CLIENT = DeviceClient(config.device_base_url, config.request_timeout)
-
-
-def compute_md5_hex(text: str) -> str:
-    return hashlib.md5(text.encode('utf-8')).hexdigest()
-
-
-class TokenManager(threading.Thread):
-    def __init__(self) -> None:
-        super().__init__(name='TokenManager', daemon=True)
-        self.base_delay = config.retry_base_delay
-        self.max_backoff = config.retry_max_backoff
-        self.refresh_interval = config.token_refresh_interval
-
-    def run(self) -> None:
-        delay = self.base_delay
-        while not STOP_EVENT.is_set():
-            username = config.device_username
-            pw_md5 = config.device_password_md5
-            if not pw_md5 and config.device_password:
-                pw_md5 = compute_md5_hex(config.device_password)
-
-            if username and pw_md5:
-                try:
-                    resp = CLIENT.login(username, pw_md5)
-                    # Expecting: {"code":0, "message":"OK", "session":..., "token":"..."}
-                    token = resp.get('token')
-                    session = resp.get('session')
-                    code = resp.get('code')
-                    if token and (code == 0 or code is None):
-                        STATE.set_token(token, session)
-                        STATE.set_login_error(None)
-                        logger.info('Device login succeeded; session=%s', str(session))
-                        delay = self.base_delay
-                        # Wait until refresh interval or stop
-                        STOP_EVENT.wait(self.refresh_interval)
-                        continue
+                    # If device indicates token invalid, force refresh and retry
+                    if isinstance(body_json, dict) and body_json.get("code") == 0:
+                        self._update_marker(op_type)
+                        return 200, body_json
                     else:
-                        msg = resp.get('message') or resp.get('msg') or 'Unknown login response'
-                        STATE.set_login_error(str(msg))
-                        STATE.set_token(None, None)
-                        logger.warning('Device login failed: %s', msg)
-                except Exception as e:
-                    STATE.set_login_error(str(e))
-                    STATE.set_token(None, None)
-                    logger.error('Device login exception: %s', e)
-                # Backoff on failure
-                sleep_for = min(delay, self.max_backoff)
-                logger.info('Retrying login in %.2fs', sleep_for)
-                STOP_EVENT.wait(sleep_for)
-                delay = min(delay * 2.0, self.max_backoff)
-            else:
-                # No credentials; idle until refresh interval
-                logger.debug('No device credentials provided; token manager idle')
-                STOP_EVENT.wait(self.refresh_interval)
+                        # Possible token issue or other error; force refresh once and retry
+                        logging.warning("Device returned non-zero code=%s msg=%s on attempt %d", body_json.get("code"), body_json.get("msg") or body_json.get("message"), attempt)
+                        if attempt < self.cfg.retry_max:
+                            self.tokens.force_refresh()
+                            time.sleep(backoff)
+                            backoff = min(backoff * 2.0, self.cfg.backoff_max)
+                            continue
+                        else:
+                            return 502, body_json
 
+            except HTTPError as e:
+                last_exc = e
+                status = e.code
+                try:
+                    err_text = e.read().decode("utf-8")
+                except Exception:
+                    err_text = ""
+                logging.error("HTTPError from device: %s %s", status, err_text)
+                if status in (401, 403):
+                    self.tokens.force_refresh()
+                if attempt < self.cfg.retry_max:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2.0, self.cfg.backoff_max)
+                    continue
+                return 502, {"error": "device_http_error", "status": status, "body": err_text}
+            except URLError as e:
+                last_exc = e
+                logging.error("URLError from device: %s", e)
+                if attempt < self.cfg.retry_max:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2.0, self.cfg.backoff_max)
+                    continue
+                return 504, {"error": "device_unreachable", "reason": str(e)}
+            except Exception as e:
+                last_exc = e
+                logging.exception("Unexpected error calling device")
+                if attempt < self.cfg.retry_max:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2.0, self.cfg.backoff_max)
+                    continue
+                return 500, {"error": "unexpected", "reason": str(e)}
 
-def parse_json_body(handler: BaseHTTPRequestHandler) -> Optional[Dict[str, Any]]:
-    try:
-        length_str = handler.headers.get('Content-Length')
-        if not length_str:
-            return {}
-        length = int(length_str)
-        data = handler.rfile.read(length) if length > 0 else b''
-        if not data:
-            return {}
-        return json.loads(data.decode('utf-8'))
-    except json.JSONDecodeError:
-        send_json(handler, 400, {"error": "Invalid JSON body"})
-        return None
-    except Exception as e:
-        logger.exception('Error reading request body')
-        send_json(handler, 400, {"error": f"Failed to read request body: {e}"})
-        return None
-
-
-def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Dict[str, Any]) -> None:
-    body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-    handler.send_response(status)
-    handler.send_header('Content-Type', 'application/json; charset=utf-8')
-    handler.send_header('Content-Length', str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
+        # Shouldn't reach here normally
+        return 500, {"error": "retries_exhausted", "reason": str(last_exc) if last_exc else "unknown"}
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'ESLDriver/1.0'
+    cfg: Config = None
+    tokens: TokenManager = None
+    client: DeviceClient = None
 
-    def do_POST(self) -> None:
-        if self.path == '/esl/flush':
-            self._handle_esl_flush()
-            return
-        send_json(self, 404, {"error": "Not found"})
-
-    def do_PUT(self) -> None:
-        if self.path == '/esl/data':
-            self._handle_esl_data()
-            return
-        send_json(self, 404, {"error": "Not found"})
-
-    def log_message(self, format: str, *args) -> None:
-        logger.info("%s - - %s", self.client_address[0], format % args)
-
-    def _get_effective_token(self) -> Optional[str]:
-        # Prefer token from client header; fallback to managed token
-        token_hdr = self.headers.get('token')
-        if token_hdr:
-            return token_hdr
-        return STATE.get_token()
-
-    def _handle_esl_flush(self) -> None:
-        body = parse_json_body(self)
-        if body is None:
-            return
-        tag = body.get('tag') if isinstance(body, dict) else None
-        if not isinstance(tag, str) or not tag:
-            send_json(self, 400, {"error": "Missing or invalid 'tag'"})
-            return
-        token = self._get_effective_token()
-        if not token:
-            send_json(self, 401, {"error": "Missing token. Provide 'token' header or configure credentials for auto-login."})
-            return
-        logger.info('ESL flush request for tag=%s', tag)
+    def _send_json(self, status: int, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json;charset=UTF-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
         try:
-            resp = CLIENT.esl_flush(token, tag)
-            STATE.set_last_flush({"tag": tag}, resp)
-            STATE.set_last_update()
-            send_json(self, 200, resp)
-        except error.HTTPError as he:
-            if he.code in (401, 403) and not self.headers.get('token'):
-                # Try re-login once and retry
-                if self._attempt_relogin():
-                    try:
-                        resp2 = CLIENT.esl_flush(STATE.get_token() or '', tag)
-                        STATE.set_last_flush({"tag": tag}, resp2)
-                        STATE.set_last_update()
-                        send_json(self, 200, resp2)
-                        return
-                    except Exception as e2:
-                        logger.error('Retry flush failed: %s', e2)
-            logger.error('Flush failed: %s', he)
-            send_json(self, 502, {"error": f"Device error: HTTP {he.code}"})
-        except Exception as e:
-            logger.error('Flush exception: %s', e)
-            send_json(self, 502, {"error": f"Device exception: {e}"})
-
-    def _handle_esl_data(self) -> None:
-        body = parse_json_body(self)
-        if body is None:
-            return
-        if not isinstance(body, dict):
-            send_json(self, 400, {"error": "JSON body must be an object"})
-            return
-        token = self._get_effective_token()
-        if not token:
-            send_json(self, 401, {"error": "Missing token. Provide 'token' header or configure credentials for auto-login."})
-            return
-        logger.info('ESL data update request')
-        try:
-            resp = CLIENT.product_alert(token, body)
-            STATE.set_last_data(body, resp)
-            STATE.set_last_update()
-            send_json(self, 200, resp)
-        except error.HTTPError as he:
-            if he.code in (401, 403) and not self.headers.get('token'):
-                if self._attempt_relogin():
-                    try:
-                        resp2 = CLIENT.product_alert(STATE.get_token() or '', body)
-                        STATE.set_last_data(body, resp2)
-                        STATE.set_last_update()
-                        send_json(self, 200, resp2)
-                        return
-                    except Exception as e2:
-                        logger.error('Retry data update failed: %s', e2)
-            logger.error('Data update failed: %s', he)
-            send_json(self, 502, {"error": f"Device error: HTTP {he.code}"})
-        except Exception as e:
-            logger.error('Data update exception: %s', e)
-            send_json(self, 502, {"error": f"Device exception: {e}"})
-
-    def _attempt_relogin(self) -> bool:
-        username = config.device_username
-        pw_md5 = config.device_password_md5
-        if not pw_md5 and config.device_password:
-            pw_md5 = compute_md5_hex(config.device_password)
-        if not (username and pw_md5):
-            logger.warning('Cannot relogin: missing credentials')
-            return False
-        try:
-            resp = CLIENT.login(username, pw_md5)
-            token = resp.get('token')
-            session = resp.get('session')
-            code = resp.get('code')
-            if token and (code == 0 or code is None):
-                STATE.set_token(token, session)
-                STATE.set_login_error(None)
-                logger.info('Re-login succeeded; session=%s', session)
-                return True
-            logger.warning('Re-login failed: %s', resp)
-            return False
-        except Exception as e:
-            logger.error('Re-login exception: %s', e)
-            return False
-
-
-def serve() -> None:
-    srv = ThreadingHTTPServer((config.http_host, config.http_port), Handler)
-
-    def shutdown(signum=None, frame=None):
-        logger.info('Shutting down (signal %s)', str(signum))
-        STOP_EVENT.set()
-        try:
-            srv.shutdown()
-        except Exception:
+            self.wfile.write(body)
+        except BrokenPipeError:
             pass
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    def _read_json_body(self):
+        length = int(self.headers.get('Content-Length', '0') or 0)
+        data = self.rfile.read(length) if length > 0 else b''
+        if not data:
+            return {}
+        try:
+            return json.loads(data.decode('utf-8'))
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON body")
 
-    token_mgr = TokenManager()
-    token_mgr.start()
+    def log_message(self, format, *args):
+        logging.info("%s - %s" % (self.address_string(), format % args))
 
-    logger.info('HTTP server listening on %s:%s', config.http_host, config.http_port)
+    def do_POST(self):
+        if self.path == "/esl/flush":
+            self._handle_esl_flush()
+            return
+        self._send_json(404, {"error": "not_found"})
+
+    def do_PUT(self):
+        if self.path == "/esl/data":
+            self._handle_esl_data()
+            return
+        self._send_json(404, {"error": "not_found"})
+
+    def _handle_esl_flush(self):
+        try:
+            body = self._read_json_body()
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        tag = body.get("tag")
+        if not tag:
+            self._send_json(400, {"error": "missing_field", "field": "tag"})
+            return
+        incoming_token = self.headers.get("token") or self.headers.get("Token")
+        status, resp = self.client.call_device(
+            path="/api/esl/eslflush",
+            method="POST",
+            json_body={"tag": tag},
+            incoming_token=incoming_token,
+            op_type="flush",
+        )
+        self._send_json(status, resp if isinstance(resp, dict) else {"result": resp})
+
+    def _handle_esl_data(self):
+        try:
+            body = self._read_json_body()
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        if not isinstance(body, dict) or not body:
+            self._send_json(400, {"error": "empty_or_invalid_payload"})
+            return
+        incoming_token = self.headers.get("token") or self.headers.get("Token")
+        status, resp = self.client.call_device(
+            path="/api/esl/productalert",
+            method="POST",  # device expects POST even though our API is PUT
+            json_body=body,
+            incoming_token=incoming_token,
+            op_type="data",
+        )
+        self._send_json(status, resp if isinstance(resp, dict) else {"result": resp})
+
+
+def run_server():
+    cfg = Config()
+    tokens = TokenManager(cfg)
+    tokens.start()
+    client = DeviceClient(cfg, tokens)
+
+    Handler.cfg = cfg
+    Handler.tokens = tokens
+    Handler.client = client
+
+    httpd = ThreadingHTTPServer((cfg.http_host, cfg.http_port), Handler)
+    httpd.timeout = 1.0
+
+    stop_event = threading.Event()
+
+    def shutdown_handler(signum, frame):
+        logging.info("Received signal %s; shutting down...", signum)
+        stop_event.set()
+        # Trigger serve_forever to exit
+        httpd.shutdown()
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    logging.info("HTTP server starting on %s:%d", cfg.http_host, cfg.http_port)
     try:
-        srv.serve_forever(poll_interval=0.5)
+        httpd.serve_forever()
     finally:
-        STOP_EVENT.set()
-        logger.info('Waiting for TokenManager to exit...')
-        token_mgr.join(timeout=10.0)
-        logger.info('Shutdown complete')
+        logging.info("HTTP server stopping...")
+        tokens.stop()
+        httpd.server_close()
+        logging.info("Shutdown complete")
 
 
-if __name__ == '__main__':
-    try:
-        serve()
-    except Exception as e:
-        logger.error('Fatal error: %s', e)
-        sys.exit(1)
+if __name__ == "__main__":
+    run_server()
