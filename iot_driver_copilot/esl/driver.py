@@ -1,338 +1,401 @@
 import json
 import logging
+import os
 import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib import request, error
+from typing import Any, Dict, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
-from config import load_config
+
+# ----------------------- Config -----------------------
+class Config:
+    def __init__(self) -> None:
+        self.http_host = self._get_env("HTTP_HOST")
+        self.http_port = self._get_int("HTTP_PORT")
+
+        self.device_base_url = self._get_env("DEVICE_BASE_URL")
+        self.device_login_path = self._get_env("DEVICE_LOGIN_PATH")
+        self.device_flush_path = self._get_env("DEVICE_FLUSH_PATH")
+        self.device_update_path = self._get_env("DEVICE_UPDATE_PATH")
+
+        self.device_username = self._get_env("DEVICE_LOGIN_USERNAME")
+        self.device_password = self._get_env("DEVICE_LOGIN_PASSWORD")
+
+        self.device_timeout_sec = self._get_float("DEVICE_TIMEOUT_SECONDS")
+        self.retry_max_attempts = self._get_int("RETRY_MAX_ATTEMPTS")
+        self.backoff_initial_ms = self._get_int("BACKOFF_INITIAL_MS")
+        self.backoff_max_ms = self._get_int("BACKOFF_MAX_MS")
+
+        self.token_refresh_seconds = self._get_int("TOKEN_REFRESH_SECONDS")
+
+        self.log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+    def _get_env(self, key: str) -> str:
+        v = os.environ.get(key)
+        if v is None or v == "":
+            raise RuntimeError(f"Missing required environment variable: {key}")
+        return v
+
+    def _get_int(self, key: str) -> int:
+        v = self._get_env(key)
+        try:
+            return int(v)
+        except ValueError:
+            raise RuntimeError(f"Invalid int for {key}: {v}")
+
+    def _get_float(self, key: str) -> float:
+        v = self._get_env(key)
+        try:
+            return float(v)
+        except ValueError:
+            raise RuntimeError(f"Invalid float for {key}: {v}")
 
 
-class ThreadSafeState:
-    def __init__(self):
-        self._lock = threading.RLock()
-        self.token = None
-        self.session = None
-        self.last_login_ts = None
-        self.last_error = None
-        self.last_flush_result = None
-        self.last_data_result = None
-        self.last_flush_ts = None
-        self.last_data_ts = None
+# ----------------------- Shared State -----------------------
+@dataclass
+class SharedState:
+    token: Optional[str] = None
+    token_last_update_ts: Optional[float] = None
+    last_login_msg: Optional[str] = None
 
-    def set_token(self, token, session):
-        with self._lock:
+    last_update_response: Optional[Dict[str, Any]] = None
+    last_update_ts: Optional[float] = None
+
+    last_flush_response: Optional[Dict[str, Any]] = None
+    last_flush_ts: Optional[float] = None
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def set_token(self, token: str, msg: str = "OK") -> None:
+        with self.lock:
             self.token = token
-            self.session = session
-            self.last_login_ts = time.time()
-            self.last_error = None
+            self.token_last_update_ts = time.time()
+            self.last_login_msg = msg
 
-    def clear_token(self, err_msg=None):
-        with self._lock:
+    def clear_token(self, msg: str = "") -> None:
+        with self.lock:
             self.token = None
-            self.session = None
-            if err_msg:
-                self.last_error = err_msg
+            self.last_login_msg = msg
 
-    def get_token(self):
-        with self._lock:
+    def get_token(self) -> Optional[str]:
+        with self.lock:
             return self.token
 
-    def set_last_flush(self, result):
-        with self._lock:
-            self.last_flush_result = result
+    def set_last_update(self, resp: Dict[str, Any]) -> None:
+        with self.lock:
+            self.last_update_response = resp
+            self.last_update_ts = time.time()
+
+    def set_last_flush(self, resp: Dict[str, Any]) -> None:
+        with self.lock:
+            self.last_flush_response = resp
             self.last_flush_ts = time.time()
 
-    def set_last_data(self, result):
-        with self._lock:
-            self.last_data_result = result
-            self.last_data_ts = time.time()
+
+# ----------------------- HTTP Utilities -----------------------
+def join_url(base: str, path: str) -> str:
+    if not base.endswith('/') and not path.startswith('/'):
+        return base + '/' + path
+    return base + path if path.startswith('/') else urljoin(base, path)
 
 
-class TokenManager:
-    def __init__(self, cfg, state: ThreadSafeState):
+def http_post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: float) -> Tuple[int, Dict[str, Any], bytes]:
+    data = json.dumps(payload).encode('utf-8')
+    req = Request(url=url, data=data, method='POST')
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            status = resp.getcode()
+    except HTTPError as e:
+        body = e.read() if hasattr(e, 'read') else b''
+        status = e.code
+    except URLError as e:
+        raise e
+
+    parsed: Dict[str, Any] = {}
+    if body:
+        try:
+            parsed = json.loads(body.decode('utf-8'))
+        except Exception:
+            parsed = {"raw": body.decode('utf-8', errors='replace')}
+    return status, parsed, body
+
+
+# ----------------------- Token Manager -----------------------
+class TokenManager(threading.Thread):
+    def __init__(self, cfg: Config, state: SharedState, shutdown_event: threading.Event) -> None:
+        super().__init__(daemon=True)
         self.cfg = cfg
         self.state = state
-        self._stop = threading.Event()
-        self._force_login = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="token-manager", daemon=True)
+        self.shutdown_event = shutdown_event
 
-    def start(self):
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        self._force_login.set()
-        self._thread.join(timeout=5)
-
-    def force_relogin(self):
-        self._force_login.set()
-
-    def _run(self):
-        attempt = 0
-        while not self._stop.is_set():
-            try:
-                ok = self._login_once()
-                if ok:
-                    attempt = 0
-                    logging.info("Token acquired; next refresh in %ss", self.cfg.token_refresh_interval_sec)
-                    # Wait for refresh interval or forced relogin/stop
-                    signaled = self._wait_with_events(self.cfg.token_refresh_interval_sec)
-                    if signaled:
-                        self._force_login.clear()
-                        continue
-                else:
-                    # failed login
-                    delay = min(self.cfg.retry_max_delay_ms, self.cfg.retry_base_delay_ms * (2 ** attempt)) / 1000.0
-                    logging.warning("Login failed, retrying in %.2fs (attempt %d)", delay, attempt + 1)
-                    if self._wait_with_events(delay):
-                        self._force_login.clear()
-                    attempt = min(attempt + 1, self.cfg.retry_max)
-            except Exception as e:
-                logging.exception("Unexpected error in token manager: %s", e)
-                delay = min(self.cfg.retry_max_delay_ms, self.cfg.retry_base_delay_ms * (2 ** attempt)) / 1000.0
-                if self._wait_with_events(delay):
-                    self._force_login.clear()
-                attempt = min(attempt + 1, self.cfg.retry_max)
-
-    def _wait_with_events(self, timeout_sec: float) -> bool:
-        # Wait until stop or force_login is set, or timeout
-        end = time.time() + timeout_sec
-        while time.time() < end:
-            if self._stop.is_set() or self._force_login.is_set():
-                return True
-            time.sleep(0.1)
-        return False
-
-    def _login_once(self) -> bool:
-        url = urljoin(self.cfg.device_base_url + '/', 'api/login')
-        payload = {
-            "username": self.cfg.device_username,
-            "password": self.cfg.device_password_md5,
-        }
-        headers = {
-            "Content-Type": "application/json;charset=UTF-8",
-        }
-        data = json.dumps(payload).encode('utf-8')
-        req = request.Request(url, data=data, headers=headers, method='POST')
+    def login_once(self) -> bool:
+        url = join_url(self.cfg.device_base_url, self.cfg.device_login_path)
+        payload = {"username": self.cfg.device_username, "password": self.cfg.device_password}
+        headers = {"Content-Type": "application/json;charset=UTF-8"}
+        logging.info(f"Attempting login to device: {url}")
         try:
-            ctx = self.cfg.ssl_context()
-            with request.urlopen(req, timeout=self.cfg.request_timeout_sec, context=ctx) as resp:
-                body = resp.read()
-                text = body.decode('utf-8', errors='replace')
-                try:
-                    obj = json.loads(text)
-                except json.JSONDecodeError:
-                    logging.error("Login response is not JSON: %s", text)
-                    self.state.clear_token("non-json login response")
-                    return False
-                if 'token' in obj and obj.get('code') in (0, None):
-                    token = obj.get('token')
-                    session = obj.get('session')
-                    self.state.set_token(token, session)
-                    logging.info("Logged in to device, session=%s", session)
-                    return True
-                else:
-                    msg = obj.get('message') or obj.get('msg') or 'login failed'
-                    logging.error("Login error: %s", msg)
-                    self.state.clear_token(msg)
-                    return False
-        except error.HTTPError as e:
-            text = e.read().decode('utf-8', errors='replace')
-            logging.error("HTTPError during login: %s %s", e, text)
-            self.state.clear_token(f"HTTPError {e.code}")
+            status, parsed, _ = http_post_json(url, payload, headers, timeout=self.cfg.device_timeout_sec)
+        except URLError as e:
+            logging.error(f"Login URLError: {e}")
             return False
         except Exception as e:
-            logging.error("Error during login: %s", e)
-            self.state.clear_token(str(e))
+            logging.exception(f"Login exception: {e}")
             return False
 
+        code = parsed.get("code")
+        token = parsed.get("token")
+        msg = parsed.get("msg") or parsed.get("message") or f"HTTP {status}"
 
-class DeviceProxy:
-    def __init__(self, cfg, state: ThreadSafeState, token_mgr: TokenManager):
+        if status == 200 and code == 0 and isinstance(token, str) and token:
+            self.state.set_token(token, msg=msg)
+            masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "****"
+            logging.info(f"Login successful. Token: {masked}")
+            return True
+        else:
+            logging.error(f"Login failed. Status={status}, code={code}, msg={msg}")
+            return False
+
+    def run(self) -> None:
+        delay_ms = self.cfg.backoff_initial_ms
+        # Ensure initial login
+        while not self.shutdown_event.is_set():
+            ok = self.login_once()
+            if ok:
+                break
+            sleep_s = min(delay_ms, self.cfg.backoff_max_ms) / 1000.0
+            logging.warning(f"Login retry in {sleep_s:.2f}s")
+            if self.shutdown_event.wait(timeout=sleep_s):
+                return
+            delay_ms = min(delay_ms * 2, self.cfg.backoff_max_ms)
+
+        # Periodic refresh loop
+        while not self.shutdown_event.is_set():
+            # Sleep until refresh needed
+            if self.shutdown_event.wait(timeout=self.cfg.token_refresh_seconds):
+                break
+            logging.info("Refreshing token...")
+            ok = self.login_once()
+            if not ok:
+                # On refresh failure, attempt with backoff until success or shutdown
+                delay_ms = self.cfg.backoff_initial_ms
+                while not self.shutdown_event.is_set():
+                    if self.login_once():
+                        break
+                    sleep_s = min(delay_ms, self.cfg.backoff_max_ms) / 1000.0
+                    logging.warning(f"Token refresh retry in {sleep_s:.2f}s")
+                    if self.shutdown_event.wait(timeout=sleep_s):
+                        return
+                    delay_ms = min(delay_ms * 2, self.cfg.backoff_max_ms)
+
+
+# ----------------------- Device Bridge -----------------------
+class DeviceBridge:
+    def __init__(self, cfg: Config, state: SharedState):
         self.cfg = cfg
         self.state = state
-        self.token_mgr = token_mgr
 
-    def _do_request(self, method: str, path: str, body_obj: dict, need_token: bool = True) -> tuple[int, dict | str]:
-        # Ensure token availability if needed
-        token = self.state.get_token() if need_token else None
-        if need_token and not token:
-            # Trigger a relogin and wait up to configured timeout
-            self.token_mgr.force_relogin()
-            deadline = time.time() + self.cfg.token_wait_timeout_sec
-            while time.time() < deadline:
-                token = self.state.get_token()
-                if token:
-                    break
-                time.sleep(0.1)
+    def _do_device_post(self, path: str, payload: Dict[str, Any], with_token: bool = True) -> Tuple[int, Dict[str, Any]]:
+        url = join_url(self.cfg.device_base_url, path)
+        headers = {"Content-Type": "application/json;charset=UTF-8"}
+        if with_token:
+            token = self.state.get_token()
             if not token:
-                return 503, {"error": "token_unavailable", "message": "Device token not available"}
-
-        url = urljoin(self.cfg.device_base_url + '/', path.lstrip('/'))
-        headers = {
-            "Content-Type": "application/json;charset=UTF-8",
-        }
-        if need_token and token:
+                raise RuntimeError("No token available; device not connected")
             headers["token"] = token
 
-        data_bytes = json.dumps(body_obj).encode('utf-8') if body_obj is not None else None
-        req = request.Request(url, data=data_bytes, headers=headers, method=method)
-        ctx = self.cfg.ssl_context()
-
-        try:
-            with request.urlopen(req, timeout=self.cfg.request_timeout_sec, context=ctx) as resp:
-                status = resp.getcode()
-                text = resp.read().decode('utf-8', errors='replace')
-                try:
-                    obj = json.loads(text)
-                except json.JSONDecodeError:
-                    obj = text
-                return status, obj
-        except error.HTTPError as e:
-            text = e.read().decode('utf-8', errors='replace')
-            # If unauthorized, force a relogin once and retry
-            if e.code in (401, 403) and need_token:
-                logging.warning("Auth error (%s). Forcing relogin and retrying once.", e.code)
-                self.token_mgr.force_relogin()
-                # small wait for token
-                deadline = time.time() + min(2, self.cfg.token_wait_timeout_sec)
-                while time.time() < deadline:
-                    if self.state.get_token():
-                        break
-                    time.sleep(0.1)
-                # Retry once
-                return self._do_request(method, path, body_obj, need_token=True)
-            logging.error("Device HTTPError %s: %s", e.code, text)
+        attempts = 0
+        delay_ms = self.cfg.backoff_initial_ms
+        last_status = 0
+        last_parsed: Dict[str, Any] = {}
+        while attempts < self.cfg.retry_max_attempts:
+            attempts += 1
             try:
-                obj = json.loads(text)
-            except json.JSONDecodeError:
-                obj = {"error": "device_http_error", "status": e.code, "body": text}
-            return e.code, obj
-        except Exception as e:
-            logging.error("Device request error: %s", e)
-            return 502, {"error": "device_request_failed", "message": str(e)}
+                status, parsed, _ = http_post_json(url, payload, headers, timeout=self.cfg.device_timeout_sec)
+                last_status, last_parsed = status, parsed
+                # Device returns JSON with code==0 on success
+                if status == 200 and isinstance(parsed, dict):
+                    code = parsed.get("code")
+                    if code == 0:
+                        return status, parsed
+                # Non-success: fall through to retry logic
+                logging.warning(f"Device POST non-success (attempt {attempts}/{self.cfg.retry_max_attempts}), status={status}, body={parsed}")
+            except URLError as e:
+                logging.error(f"Device POST URLError (attempt {attempts}/{self.cfg.retry_max_attempts}): {e}")
+            except Exception as e:
+                logging.exception(f"Device POST exception (attempt {attempts}/{self.cfg.retry_max_attempts}): {e}")
+
+            if attempts >= self.cfg.retry_max_attempts:
+                break
+            time.sleep(min(delay_ms, self.cfg.backoff_max_ms) / 1000.0)
+            delay_ms = min(delay_ms * 2, self.cfg.backoff_max_ms)
+        return last_status, last_parsed
+
+    def flush(self, tag: str) -> Tuple[int, Dict[str, Any]]:
+        payload = {"tag": tag}
+        status, parsed = self._do_device_post(self.cfg.device_flush_path, payload, with_token=True)
+        if status == 200 and isinstance(parsed, dict):
+            self.state.set_last_flush(parsed)
+        return status, parsed
+
+    def update(self, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        status, parsed = self._do_device_post(self.cfg.device_update_path, payload, with_token=True)
+        if status == 200 and isinstance(parsed, dict):
+            self.state.set_last_update(parsed)
+        return status, parsed
 
 
-class ESLHandler(BaseHTTPRequestHandler):
-    # Shared components set by server initialization
-    proxy: DeviceProxy = None
-    state: ThreadSafeState = None
+# ----------------------- HTTP Server -----------------------
+class Handler(BaseHTTPRequestHandler):
+    cfg: Config = None  # type: ignore
+    state: SharedState = None  # type: ignore
+    bridge: DeviceBridge = None  # type: ignore
 
-    def _send_json(self, status: int, obj):
-        body = json.dumps(obj).encode('utf-8') if not isinstance(obj, (bytes, bytearray)) else obj
-        self.send_response(status)
+    def _send_json(self, code: int, obj: Dict[str, Any]) -> None:
+        body = json.dumps(obj).encode('utf-8')
+        self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self):
-        length = int(self.headers.get('Content-Length', '0'))
-        if length <= 0:
-            return None
-        raw = self.rfile.read(length)
+    def _read_json(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        length = self.headers.get('Content-Length')
+        if not length:
+            return None, "Missing Content-Length"
         try:
-            return json.loads(raw.decode('utf-8'))
+            n = int(length)
+        except ValueError:
+            return None, "Invalid Content-Length"
+        try:
+            data = self.rfile.read(n)
+            payload = json.loads(data.decode('utf-8'))
+            if not isinstance(payload, dict):
+                return None, "JSON body must be an object"
+            return payload, None
         except json.JSONDecodeError:
-            return None
+            return None, "Invalid JSON"
+        except Exception as e:
+            return None, f"Error reading body: {e}"
 
-    def log_message(self, format, *args):
-        # Bridge to logging
-        logging.info("%s - - %s", self.address_string(), format % args)
+    def log_message(self, format: str, *args: Any) -> None:
+        logging.info("%s - - [%s] " + format, self.address_string(), self.log_date_time_string(), *args)
 
-    def do_POST(self):
-        if self.path == '/esl/flush':
-            body = self._read_json()
-            if not isinstance(body, dict) or 'tag' not in body or not body['tag']:
-                return self._send_json(400, {"error": "bad_request", "message": "JSON body with 'tag' is required"})
-            status, obj = self.proxy._do_request('POST', '/api/esl/eslflush', {"tag": str(body['tag'])}, need_token=True)
-            if 200 <= status < 300:
-                ESLHandler.state.set_last_flush(obj)
-                return self._send_json(200, obj)
-            else:
-                return self._send_json(502 if status >= 500 else status, obj)
-        else:
-            self.send_error(404, "Not Found")
-
-    def do_PUT(self):
-        if self.path == '/esl/data':
-            body = self._read_json()
-            if not isinstance(body, dict):
-                return self._send_json(400, {"error": "bad_request", "message": "JSON body is required"})
-            # Forward body as-is to device
-            status, obj = self.proxy._do_request('POST', '/api/esl/productalert', body, need_token=True)
-            if 200 <= status < 300:
-                ESLHandler.state.set_last_data(obj)
-                return self._send_json(200, obj)
-            else:
-                return self._send_json(502 if status >= 500 else status, obj)
-        else:
-            self.send_error(404, "Not Found")
-
-    def do_GET(self):
-        # Only explicitly required endpoints are implemented
-        self.send_error(405, "Method Not Allowed")
-
-    def do_DELETE(self):
-        self.send_error(405, "Method Not Allowed")
-
-
-class Server:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.state = ThreadSafeState()
-        self.token_mgr = TokenManager(cfg, self.state)
-        self.proxy = DeviceProxy(cfg, self.state, self.token_mgr)
-        self.httpd = ThreadingHTTPServer((cfg.http_host, cfg.http_port), ESLHandler)
-        ESLHandler.proxy = self.proxy
-        ESLHandler.state = self.state
-
-    def start(self):
-        logging.info("Starting token manager...")
-        self.token_mgr.start()
-        logging.info("HTTP server listening on %s:%s", self.cfg.http_host, self.cfg.http_port)
+    def do_POST(self) -> None:
         try:
-            self.httpd.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.shutdown()
+            if self.path == "/esl/flush":
+                self.handle_esl_flush()
+                return
+            if self.path == "/esl/update":
+                self.handle_esl_update()
+                return
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
+        except Exception as e:
+            logging.exception(f"Unhandled exception in handler: {e}")
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal Server Error"})
 
-    def shutdown(self):
-        logging.info("Shutting down HTTP server...")
+    def handle_esl_flush(self) -> None:
+        payload, err = self._read_json()
+        if err:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": err})
+            return
+        tag = payload.get("tag") if payload else None
+        if not isinstance(tag, str) or not tag:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Field 'tag' (string) is required"})
+            return
+        token = self.state.get_token()
+        if not token:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Device not connected (token not available)"})
+            return
+        logging.info(f"Flushing ESL tag={tag}")
+        status, parsed = self.bridge.flush(tag)
+        if status == 200 and isinstance(parsed, dict):
+            self._send_json(HTTPStatus.OK, parsed)
+        else:
+            self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "Device call failed", "device_status": status, "device_body": parsed})
+
+    def handle_esl_update(self) -> None:
+        payload, err = self._read_json()
+        if err:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": err})
+            return
+        if not isinstance(payload, dict) or len(payload) == 0:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Non-empty JSON object is required"})
+            return
+        token = self.state.get_token()
+        if not token:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Device not connected (token not available)"})
+            return
+        logging.info(f"Updating ESL data with fields: {list(payload.keys())}")
+        status, parsed = self.bridge.update(payload)
+        if status == 200 and isinstance(parsed, dict):
+            self._send_json(HTTPStatus.OK, parsed)
+        else:
+            self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "Device call failed", "device_status": status, "device_body": parsed})
+
+
+# ----------------------- Main -----------------------
+shutdown_event = threading.Event()
+
+
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
+
+
+def main() -> None:
+    cfg = Config()
+    setup_logging(cfg.log_level)
+
+    state = SharedState()
+    bridge = DeviceBridge(cfg, state)
+
+    Handler.cfg = cfg
+    Handler.state = state
+    Handler.bridge = bridge
+
+    server = ThreadingHTTPServer((cfg.http_host, cfg.http_port), Handler)
+
+    token_thread = TokenManager(cfg, state, shutdown_event)
+    token_thread.start()
+
+    def handle_sig(signum, frame):  # type: ignore
+        logging.info(f"Received signal {signum}, shutting down...")
+        shutdown_event.set()
         try:
-            self.httpd.shutdown()
-            self.httpd.server_close()
+            server.shutdown()
         except Exception:
             pass
-        logging.info("Stopping token manager...")
+
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
+    logging.info(f"HTTP server listening on {cfg.http_host}:{cfg.http_port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        shutdown_event.set()
         try:
-            self.token_mgr.stop()
+            server.server_close()
         except Exception:
             pass
-        logging.info("Shutdown complete.")
+        token_thread.join(timeout=5.0)
+        logging.info("Shutdown complete")
 
 
-def main():
-    cfg = load_config()
-    logging.basicConfig(level=cfg.log_level, format='[%(asctime)s] %(levelname)s: %(message)s')
-
-    srv = Server(cfg)
-
-    # Graceful shutdown on SIGTERM
-    def handle_sigterm(signum, frame):
-        logging.info("Received signal %s, shutting down...", signum)
-        srv.shutdown()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
-    srv.start()
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
