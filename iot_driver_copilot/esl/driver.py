@@ -1,308 +1,374 @@
 import json
 import logging
+import os
 import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib import request as urlrequest
-from urllib import error as urlerror
-from urllib.parse import urljoin
-
-from config import load_config, Config, ConfigError
+from typing import Any, Dict, Optional, Tuple
+from urllib import request, error
 
 
-# Global singletons will be initialized in main()
-CONFIG: Config | None = None
-TOKEN_MANAGER: "TokenManager" | None = None
-LAST_STATE: "LastState" | None = None
-HTTPD: ThreadingHTTPServer | None = None
-STOP_EVENT = threading.Event()
-
-
-class LastState:
+class Config:
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.last_flush_result: dict | None = None
-        self.last_flush_ts: float | None = None
-        self.last_data_result: dict | None = None
-        self.last_data_ts: float | None = None
-        self.last_login_ts: float | None = None
+        # All configuration must come from environment variables
+        self.http_host = self._get_env("HTTP_HOST")
+        self.http_port = int(self._get_env("HTTP_PORT"))
+        self.esl_base_url = self._get_env("ESL_BASE_URL").rstrip("/")
+        self.esl_username = self._get_env("ESL_USERNAME")
+        self.esl_password_md5 = self._get_env("ESL_PASSWORD_MD5")
+        self.request_timeout_seconds = float(self._get_env("REQUEST_TIMEOUT_SECONDS"))
+        self.retry_base_delay_seconds = float(self._get_env("RETRY_BASE_DELAY_SECONDS"))
+        self.retry_max_delay_seconds = float(self._get_env("RETRY_MAX_DELAY_SECONDS"))
+        self.login_refresh_seconds = float(self._get_env("LOGIN_REFRESH_SECONDS"))
 
-    def set_flush(self, result: dict) -> None:
-        with self._lock:
-            self.last_flush_result = result
-            self.last_flush_ts = time.time()
-
-    def set_data(self, result: dict) -> None:
-        with self._lock:
-            self.last_data_result = result
-            self.last_data_ts = time.time()
-
-    def set_login_ts(self) -> None:
-        with self._lock:
-            self.last_login_ts = time.time()
+    @staticmethod
+    def _get_env(name: str) -> str:
+        v = os.environ.get(name)
+        if v is None or v == "":
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return v
 
 
-class TokenManager:
-    def __init__(self, cfg: Config, last_state: LastState) -> None:
-        self._cfg = cfg
-        self._last_state = last_state
-        self._token_lock = threading.Lock()
-        self._token: str | None = None
-        self._session: int | None = None
-        self._thread: threading.Thread | None = None
+class DeviceClient:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
 
-    def start(self) -> None:
-        if self._cfg.device_username and self._cfg.device_password:
-            self._thread = threading.Thread(target=self._run, name="login-worker", daemon=True)
-            self._thread.start()
-            logging.info("TokenManager: background login thread started")
-        else:
-            logging.warning("TokenManager: DEVICE_USERNAME/PASSWORD not set; will rely on client-provided token header")
+    def _http_json(self, method: str, path: str, body: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, Any]]:
+        url = f"{self.cfg.esl_base_url}{path}"
+        data_bytes = None
+        req_headers = headers.copy() if headers else {}
+        if body is not None:
+            data_bytes = json.dumps(body).encode("utf-8")
+            req_headers.setdefault("Content-Type", "application/json;charset=UTF-8")
 
-    def stop(self) -> None:
-        # Nothing to do; thread checks STOP_EVENT
-        pass
-
-    def get_token(self) -> str | None:
-        with self._token_lock:
-            return self._token
-
-    def set_token(self, token: str | None, session: int | None) -> None:
-        with self._token_lock:
-            self._token = token
-            self._session = session
-
-    def _run(self) -> None:
-        backoff = self._cfg.backoff_initial
-        while not STOP_EVENT.is_set():
-            try:
-                token, session = self._login()
-                if token:
-                    self.set_token(token, session)
-                    self._last_state.set_login_ts()
-                    logging.info("Login success; session=%s", session)
-                    # On success, reset backoff and sleep until refresh interval or stop
-                    backoff = self._cfg.backoff_initial
-                    # Sleep in small chunks to be responsive to STOP_EVENT
-                    slept = 0.0
-                    interval = self._cfg.login_refresh_interval
-                    while not STOP_EVENT.is_set() and slept < interval:
-                        nap = min(0.5, interval - slept)
-                        time.sleep(nap)
-                        slept += nap
-                    continue
-                else:
-                    logging.error("Login returned no token; will retry with backoff")
-            except Exception as e:
-                logging.error("Login failed: %s", e)
-            # Backoff on error
-            if STOP_EVENT.is_set():
-                break
-            logging.info("Reconnecting after %.2fs", backoff)
-            time.sleep(backoff)
-            backoff = min(self._cfg.backoff_max, backoff * self._cfg.backoff_factor)
-
-    def _login(self) -> tuple[str | None, int | None]:
-        payload = {
-            "username": self._cfg.device_username,
-            "password": self._cfg.device_password,
-        }
-        body = json.dumps(payload).encode("utf-8")
-        url = urljoin(self._cfg.device_base_url.rstrip("/") + "/", "api/login")
-        req = urlrequest.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json;charset=UTF-8")
-        logging.info("Attempting login to %s", url)
+        req = request.Request(url=url, data=data_bytes, headers=req_headers, method=method)
         try:
-            with urlrequest.urlopen(req, timeout=self._cfg.request_timeout) as resp:
+            with request.urlopen(req, timeout=self.cfg.request_timeout_seconds) as resp:
+                status = resp.getcode()
                 raw = resp.read()
-                data = json.loads(raw.decode("utf-8", errors="replace"))
-                token = data.get("token")
-                session = data.get("session")
-                if token:
-                    return token, session
-                return None, None
-        except urlerror.HTTPError as e:
-            msg = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Login HTTPError {e.code}: {msg}")
-        except urlerror.URLError as e:
-            raise RuntimeError(f"Login URLError: {e}")
+                # Some devices may return empty body
+                if not raw:
+                    return status, {}
+                try:
+                    return status, json.loads(raw.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    return status, {"raw": raw.decode("utf-8", errors="replace")}
+        except error.HTTPError as he:
+            body = he.read()
+            try:
+                parsed = json.loads(body.decode("utf-8", errors="replace"))
+            except Exception:
+                parsed = {"error": body.decode("utf-8", errors="replace")}
+            return he.code, parsed
+        except Exception as e:
+            raise e
+
+    def login(self) -> Tuple[str, Optional[int]]:
+        payload = {"username": self.cfg.esl_username, "password": self.cfg.esl_password_md5}
+        status, resp = self._http_json("POST", "/api/login", body=payload)
+        if status != 200:
+            raise RuntimeError(f"Login HTTP status {status}: {resp}")
+        # Expected: {"code":0, "message":"OK", "session":3, "token":"..."}
+        if isinstance(resp, dict) and resp.get("code") == 0 and resp.get("token"):
+            return str(resp.get("token")), resp.get("session")
+        raise RuntimeError(f"Login failed: {resp}")
+
+    def esl_flush(self, token: str, tag: str) -> Dict[str, Any]:
+        headers = {"token": token, "Content-Type": "application/json;charset=UTF-8"}
+        payload = {"tag": tag}
+        status, resp = self._http_json("POST", "/api/esl/eslflush", body=payload, headers=headers)
+        if status != 200:
+            raise RuntimeError(f"eslflush HTTP status {status}: {resp}")
+        return resp
+
+    def esl_productalert(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        headers = {"token": token, "Content-Type": "application/json;charset=UTF-8"}
+        status, resp = self._http_json("POST", "/api/esl/productalert", body=payload, headers=headers)
+        if status != 200:
+            raise RuntimeError(f"productalert HTTP status {status}: {resp}")
+        return resp
 
 
-class ESLHandler(BaseHTTPRequestHandler):
+class SharedState:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.token: Optional[str] = None
+        self.session: Optional[int] = None
+        self.token_updated_at: Optional[float] = None
+        self.last_flush_resp: Optional[Dict[str, Any]] = None
+        self.last_data_resp: Optional[Dict[str, Any]] = None
+        self.last_error: Optional[str] = None
+
+    def set_token(self, token: str, session: Optional[int]) -> None:
+        with self._lock:
+            self.token = token
+            self.session = session
+            self.token_updated_at = time.time()
+
+    def clear_token(self) -> None:
+        with self._lock:
+            self.token = None
+            self.session = None
+            self.token_updated_at = None
+
+    def get_token(self) -> Optional[str]:
+        with self._lock:
+            return self.token
+
+    def set_last_flush_resp(self, resp: Dict[str, Any]) -> None:
+        with self._lock:
+            self.last_flush_resp = resp
+
+    def set_last_data_resp(self, resp: Dict[str, Any]) -> None:
+        with self._lock:
+            self.last_data_resp = resp
+
+    def set_last_error(self, err: str) -> None:
+        with self._lock:
+            self.last_error = err
+
+
+class LoginWorker(threading.Thread):
+    def __init__(self, cfg: Config, client: DeviceClient, state: SharedState, stop_event: threading.Event):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.client = client
+        self.state = state
+        self.stop_event = stop_event
+
+    def run(self) -> None:
+        attempt = 0
+        next_refresh = 0.0
+        while not self.stop_event.is_set():
+            now = time.time()
+            token = self.state.get_token()
+            # Determine if we need (re)login
+            need_login = False
+            if token is None:
+                need_login = True
+            else:
+                # refresh if older than refresh interval
+                # Defensive: re-login before expiry even if unknown
+                with state._lock:
+                    updated = state.token_updated_at or 0
+                if now - updated >= self.cfg.login_refresh_seconds:
+                    need_login = True
+
+            if need_login:
+                try:
+                    logging.info("Attempting ESL login")
+                    token, session = self.client.login()
+                    self.state.set_token(token, session)
+                    attempt = 0
+                    next_refresh = time.time() + self.cfg.login_refresh_seconds
+                    logging.info("ESL login success; session=%s token_set_at=%s", session, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()))
+                except Exception as e:
+                    attempt += 1
+                    delay = min(self.cfg.retry_base_delay_seconds * (2 ** (attempt - 1)), self.cfg.retry_max_delay_seconds)
+                    self.state.set_last_error(str(e))
+                    logging.error("ESL login failed (attempt %d): %s; retrying in %.1fs", attempt, e, delay)
+                    self.stop_event.wait(delay)
+                    continue
+            # Sleep until next check or stop
+            sleep_for = 1.0
+            if next_refresh:
+                sleep_for = max(0.5, min(self.cfg.login_refresh_seconds / 4.0, 5.0))
+            self.stop_event.wait(sleep_for)
+
+
+class App:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.client = DeviceClient(cfg)
+        self.state = SharedState()
+        self.stop_event = threading.Event()
+        self.login_worker = LoginWorker(cfg, self.client, self.state, self.stop_event)
+        # Guard to avoid concurrent active login from request threads
+        self._login_lock = threading.Lock()
+
+    def start(self):
+        self.login_worker.start()
+
+    def stop(self):
+        self.stop_event.set()
+        # No explicit logout API; just stop worker
+
+    def ensure_token(self) -> str:
+        token = self.state.get_token()
+        if token:
+            return token
+        # Attempt a synchronous login once
+        with self._login_lock:
+            token = self.state.get_token()
+            if token:
+                return token
+            try:
+                logging.info("Synchronously logging in (on-demand)")
+                token, session = self.client.login()
+                self.state.set_token(token, session)
+                return token
+            except Exception as e:
+                self.state.set_last_error(str(e))
+                raise
+
+    def handle_esl_flush(self, tag: str) -> Dict[str, Any]:
+        token = self.ensure_token()
+        # Try once, if token invalid then re-login and retry once
+        try:
+            resp = self.client.esl_flush(token, tag)
+            # Device convention: code==0 success
+            if isinstance(resp, dict) and resp.get("code") != 0:
+                # Try re-login once
+                logging.warning("eslflush non-zero code: %s; attempting re-login and retry", resp)
+                self._force_relogin()
+                token = self.ensure_token()
+                resp = self.client.esl_flush(token, tag)
+            self.state.set_last_flush_resp(resp)
+            return resp
+        except Exception as e:
+            logging.error("eslflush error: %s", e)
+            self.state.set_last_error(str(e))
+            raise
+
+    def handle_esl_data(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        token = self.ensure_token()
+        try:
+            resp = self.client.esl_productalert(token, payload)
+            if isinstance(resp, dict) and resp.get("code") != 0:
+                logging.warning("productalert non-zero code: %s; attempting re-login and retry", resp)
+                self._force_relogin()
+                token = self.ensure_token()
+                resp = self.client.esl_productalert(token, payload)
+            self.state.set_last_data_resp(resp)
+            return resp
+        except Exception as e:
+            logging.error("productalert error: %s", e)
+            self.state.set_last_error(str(e))
+            raise
+
+    def _force_relogin(self):
+        with self._login_lock:
+            self.state.clear_token()
+            # Worker will re-login, but do it immediately here
+            token, session = self.client.login()
+            self.state.set_token(token, session)
+
+
+APP: Optional[App] = None
+
+
+class Handler(BaseHTTPRequestHandler):
     server_version = "ESLDriver/1.0"
 
-    def _send_json(self, status: int, obj: dict) -> None:
-        payload = json.dumps(obj).encode("utf-8")
+    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+        data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(payload)
+        self.wfile.write(data)
 
-    def _bad_request(self, message: str) -> None:
-        logging.warning("400 Bad Request: %s", message)
-        self._send_json(400, {"error": message})
-
-    def _unauthorized(self, message: str) -> None:
-        logging.warning("401 Unauthorized: %s", message)
-        self._send_json(401, {"error": message})
-
-    def _method_not_allowed(self) -> None:
-        self._send_json(405, {"error": "Method Not Allowed"})
-
-    def _not_found(self) -> None:
-        self._send_json(404, {"error": "Not Found"})
-
-    def _read_json_body(self) -> dict | None:
-        length_header = self.headers.get("Content-Length")
-        if not length_header:
-            return {}
-        try:
-            length = int(length_header)
-        except ValueError:
-            self._bad_request("Invalid Content-Length")
-            return None
-        if length == 0:
-            return {}
-        raw = self.rfile.read(length)
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            self._bad_request("Invalid JSON body")
-            return None
-
-    def do_POST(self) -> None:
+    def do_POST(self):  # for /esl/flush
         if self.path == "/esl/flush":
             self._handle_esl_flush()
         else:
-            self._not_found()
+            self.send_error(404, "Not Found")
 
-    def do_PUT(self) -> None:
+    def do_PUT(self):  # for /esl/data
         if self.path == "/esl/data":
             self._handle_esl_data()
         else:
-            self._not_found()
+            self.send_error(404, "Not Found")
 
-    def log_message(self, format: str, *args) -> None:
-        # Route server logs through logging module
-        logging.info("%s - - %s", self.client_address[0], format % args)
-
-    def _resolve_token(self) -> str | None:
-        # Priority: client-provided token header -> background token
-        token = self.headers.get("token")
-        if token:
-            return token
-        if TOKEN_MANAGER is not None:
-            return TOKEN_MANAGER.get_token()
-        return None
-
-    def _device_request(self, path: str, body_dict: dict, token: str) -> tuple[int, dict]:
-        assert CONFIG is not None
-        url = urljoin(CONFIG.device_base_url.rstrip("/") + "/", path.lstrip("/"))
-        body = json.dumps(body_dict).encode("utf-8")
-        req = urlrequest.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json;charset=UTF-8")
-        req.add_header("token", token)
-        logging.info("Forwarding to device: %s", url)
+    def _read_json_body(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         try:
-            with urlrequest.urlopen(req, timeout=CONFIG.request_timeout) as resp:
-                raw = resp.read()
-                try:
-                    data = json.loads(raw.decode("utf-8", errors="replace"))
-                except Exception:
-                    data = {"raw": raw.decode("utf-8", errors="replace")}
-                return resp.status, data
-        except urlerror.HTTPError as e:
-            payload = e.read().decode("utf-8", errors="replace")
-            try:
-                data = json.loads(payload)
-            except Exception:
-                data = {"error": payload}
-            return e.code, data
-        except urlerror.URLError as e:
-            logging.error("Device connection error: %s", e)
-            return 502, {"error": f"Device connection error: {e}"}
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            return None, "Invalid Content-Length"
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+            if not raw:
+                return {}, None
+            return json.loads(raw.decode("utf-8")), None
+        except json.JSONDecodeError:
+            return None, "Invalid JSON body"
+        except Exception as e:
+            return None, str(e)
 
-    def _handle_esl_flush(self) -> None:
-        body = self._read_json_body()
-        if body is None:
+    def _handle_esl_flush(self):
+        global APP
+        if APP is None:
+            self.send_error(500, "Server not initialized")
             return
-        tag = body.get("tag") if isinstance(body, dict) else None
-        if not tag:
-            self._bad_request("Missing required field: tag")
+        body, err = self._read_json_body()
+        if err is not None:
+            self._send_json(400, {"error": err})
             return
-        token = self._resolve_token()
-        if not token:
-            self._unauthorized("No token available. Provide 'token' header or configure DEVICE_USERNAME/PASSWORD for auto-login.")
+        tag = None
+        if isinstance(body, dict):
+            tag = body.get("tag")
+        if not tag or not isinstance(tag, str):
+            self._send_json(400, {"error": "Missing or invalid 'tag'"})
             return
-        status, data = self._device_request("api/esl/eslflush", {"tag": tag}, token)
-        if LAST_STATE is not None and status < 500:
-            LAST_STATE.set_flush(data if isinstance(data, dict) else {"data": data})
-        self._send_json(status, data if isinstance(data, dict) else {"data": data})
+        try:
+            resp = APP.handle_esl_flush(tag)
+            self._send_json(200, resp if isinstance(resp, dict) else {"data": resp})
+        except Exception as e:
+            self._send_json(502, {"error": str(e)})
 
-    def _handle_esl_data(self) -> None:
-        body = self._read_json_body()
-        if body is None:
+    def _handle_esl_data(self):
+        global APP
+        if APP is None:
+            self.send_error(500, "Server not initialized")
             return
-        if not isinstance(body, dict):
-            self._bad_request("JSON body must be an object")
+        body, err = self._read_json_body()
+        if err is not None:
+            self._send_json(400, {"error": err})
             return
-        token = self._resolve_token()
-        if not token:
-            self._unauthorized("No token available. Provide 'token' header or configure DEVICE_USERNAME/PASSWORD for auto-login.")
+        if not isinstance(body, dict) or not body:
+            self._send_json(400, {"error": "Body must be a non-empty JSON object"})
             return
-        status, data = self._device_request("api/esl/productalert", body, token)
-        if LAST_STATE is not None and status < 500:
-            LAST_STATE.set_data(data if isinstance(data, dict) else {"data": data})
-        self._send_json(status, data if isinstance(data, dict) else {"data": data})
+        try:
+            resp = APP.handle_esl_data(body)
+            self._send_json(200, resp if isinstance(resp, dict) else {"data": resp})
+        except Exception as e:
+            self._send_json(502, {"error": str(e)})
+
+    def log_message(self, format: str, *args: Any) -> None:
+        logging.info("%s - - [%s] " + format, self.client_address[0], self.log_date_time_string(), *args)
 
 
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-
-def start_http_server(cfg: Config) -> ThreadingHTTPServer:
-    server_address = (cfg.http_host, cfg.http_port)
-    httpd = ThreadingHTTPServer(server_address, ESLHandler)
-    logging.info("HTTP server listening on %s:%s", cfg.http_host, cfg.http_port)
-    return httpd
-
-
-def shutdown(signum=None, frame=None):
-    logging.info("Shutting down (signal: %s)", signum)
-    STOP_EVENT.set()
-    if HTTPD is not None:
-        # This will unblock serve_forever
-        HTTPD.shutdown()
-    logging.info("Shutdown signal processed")
-
-
-def main() -> None:
-    global CONFIG, TOKEN_MANAGER, LAST_STATE, HTTPD
-    setup_logging()
-
+def main():
+    global APP
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        CONFIG = load_config()
-    except ConfigError as e:
+        cfg = Config()
+    except Exception as e:
         logging.error("Configuration error: %s", e)
-        raise SystemExit(2)
+        raise
 
-    LAST_STATE = LastState()
-    TOKEN_MANAGER = TokenManager(CONFIG, LAST_STATE)
-    TOKEN_MANAGER.start()
+    APP = App(cfg)
+    APP.start()
 
-    # Setup signals for graceful shutdown
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    server = ThreadingHTTPServer((cfg.http_host, cfg.http_port), Handler)
 
-    HTTPD = start_http_server(CONFIG)
+    shutdown_event = threading.Event()
+
+    def _signal_handler(signum, frame):
+        logging.info("Received signal %s, shutting down...", signum)
+        shutdown_event.set()
+        APP.stop()
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    logging.info("HTTP server starting on %s:%d", cfg.http_host, cfg.http_port)
     try:
-        HTTPD.serve_forever(poll_interval=0.5)
+        server.serve_forever(poll_interval=0.5)
     finally:
+        server.server_close()
         logging.info("HTTP server stopped")
 
 
