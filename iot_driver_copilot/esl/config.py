@@ -1,93 +1,72 @@
 import os
 import logging
-from dataclasses import dataclass
+from typing import Optional
 
 
-def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
-    val = os.environ.get(name, default)
-    if required and (val is None or str(val).strip() == ""):
-        raise ValueError(f"Missing required environment variable: {name}")
+def _get_required(name: str) -> str:
+    val = os.getenv(name)
+    if val is None or val == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
     return val
 
 
-def _to_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"Invalid integer for {name}: {raw}")
+def _get_optional(name: str) -> Optional[str]:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return None
+    return val
 
 
-def _to_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
+def _parse_float(name: str, required: bool) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        if required:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return None
     try:
         return float(raw)
-    except ValueError:
-        raise ValueError(f"Invalid float for {name}: {raw}")
+    except Exception as e:
+        raise RuntimeError(f"Invalid float for {name}: {raw}") from e
 
 
-def _to_loglevel(name: str, default: str = "INFO") -> int:
-    raw = os.environ.get(name, default).upper()
-    levels = {
-        "CRITICAL": logging.CRITICAL,
-        "ERROR": logging.ERROR,
-        "WARNING": logging.WARNING,
-        "INFO": logging.INFO,
-        "DEBUG": logging.DEBUG,
-        "NOTSET": logging.NOTSET,
-    }
-    return levels.get(raw, logging.INFO)
+def _parse_int(name: str, required: bool) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        if required:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return None
+    try:
+        return int(raw)
+    except Exception as e:
+        raise RuntimeError(f"Invalid int for {name}: {raw}") from e
 
 
-@dataclass(frozen=True)
 class Config:
-    http_host: str
-    http_port: int
-    device_base_url: str
-    device_username: str | None
-    device_password_md5: str | None
-    device_timeout_seconds: float
-    device_retry_max: int
-    device_retry_backoff_initial: float
-    device_retry_backoff_max: float
-    login_refresh_seconds: int
-    log_level: int
+    def __init__(self) -> None:
+        # HTTP server bind
+        self.http_host: str = _get_required("HTTP_HOST")
+        self.http_port: int = _parse_int("HTTP_PORT", required=True)  # type: ignore
+
+        # Device base URL, e.g., http://192.168.2.97
+        base = _get_required("DEVICE_BASE_URL").rstrip("/")
+        self.device_base_url: str = base
+
+        # Credentials (optional if clients supply token header)
+        self.device_username: Optional[str] = _get_optional("DEVICE_USERNAME")
+        self.device_password: Optional[str] = _get_optional("DEVICE_PASSWORD")
+        self.device_password_md5: Optional[str] = _get_optional("DEVICE_PASSWORD_MD5")
+
+        # Timeouts and retry/backoff
+        self.request_timeout: float = _parse_float("REQUEST_TIMEOUT_SECONDS", required=True)  # type: ignore
+        self.retry_base_delay: float = _parse_float("RETRY_BASE_DELAY_SECONDS", required=True)  # type: ignore
+        self.retry_max_backoff: float = _parse_float("RETRY_MAX_BACKOFF_SECONDS", required=True)  # type: ignore
+        self.token_refresh_interval: float = _parse_float("TOKEN_REFRESH_INTERVAL_SECONDS", required=True)  # type: ignore
+
+        # Logging level
+        lvl_str = _get_required("LOG_LEVEL").upper()
+        if lvl_str not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise RuntimeError(f"Invalid LOG_LEVEL: {lvl_str}")
+        self.log_level = getattr(logging, lvl_str)
 
 
-def load_config() -> Config:
-    http_host = _get_env("HTTP_HOST", "0.0.0.0") or "0.0.0.0"
-    http_port = _to_int("HTTP_PORT", 8080)
-
-    device_base_url = _get_env("DEVICE_BASE_URL", required=True)  # e.g., http://192.168.2.97
-    if device_base_url.endswith('/'):
-        device_base_url = device_base_url[:-1]
-
-    device_username = _get_env("DEVICE_USERNAME")
-    device_password_md5 = _get_env("DEVICE_PASSWORD_MD5")
-
-    device_timeout_seconds = _to_float("DEVICE_TIMEOUT_SECONDS", 5.0)
-    device_retry_max = _to_int("DEVICE_RETRY_MAX", 3)
-    device_retry_backoff_initial = _to_float("DEVICE_RETRY_BACKOFF_INITIAL", 0.5)
-    device_retry_backoff_max = _to_float("DEVICE_RETRY_BACKOFF_MAX", 8.0)
-
-    login_refresh_seconds = _to_int("LOGIN_REFRESH_SECONDS", 600)
-
-    log_level = _to_loglevel("LOG_LEVEL", "INFO")
-
-    return Config(
-        http_host=http_host,
-        http_port=http_port,
-        device_base_url=device_base_url,
-        device_username=device_username,
-        device_password_md5=device_password_md5,
-        device_timeout_seconds=device_timeout_seconds,
-        device_retry_max=device_retry_max,
-        device_retry_backoff_initial=device_retry_backoff_initial,
-        device_retry_backoff_max=device_retry_backoff_max,
-        login_refresh_seconds=login_refresh_seconds,
-        log_level=log_level,
-    )
+config = Config()
