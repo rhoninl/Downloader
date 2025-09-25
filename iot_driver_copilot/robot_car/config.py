@@ -1,68 +1,103 @@
-# config.py
 import os
-import sys
+from dataclasses import dataclass
 from typing import Optional
+
+
+@dataclass(frozen=True)
+class Config:
+    http_host: str
+    http_port: int
+
+    device_base_url: str
+    device_set_velocity_path: str
+    device_telemetry_path: str
+
+    request_timeout_secs: float
+    poll_interval_secs: float
+    backoff_min_secs: float
+    backoff_max_secs: float
+
+    max_speed_mps: float
+
+    device_bearer_token: Optional[str]
+    device_username: Optional[str]
+    device_password: Optional[str]
 
 
 class ConfigError(Exception):
     pass
 
 
-def _get_env(name: str, required: bool = True, cast: Optional[type] = None) -> Optional[object]:
-    val = os.getenv(name)
-    if val is None or val == "":
-        if required:
-            raise ConfigError(f"Missing required environment variable: {name}")
-        return None
-    if cast is None:
-        return val
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if v is None or v == "":
+        raise ConfigError(f"Missing required environment variable: {name}")
+    return v
+
+
+def _to_int(name: str, v: str) -> int:
     try:
-        if cast is bool:
-            low = val.strip().lower()
-            if low in ("1", "true", "yes", "on"): return True
-            if low in ("0", "false", "no", "off"): return False
-            raise ValueError(f"Invalid boolean for {name}: {val}")
-        return cast(val)
-    except Exception as e:
-        raise ConfigError(f"Invalid value for {name}: {val} ({e})")
+        return int(v)
+    except Exception:
+        raise ConfigError(f"Invalid int for {name}: {v}")
 
 
-class Config:
-    def __init__(self):
-        # HTTP Server
-        self.http_host: str = _get_env("HTTP_HOST", required=True, cast=str)  # e.g., 0.0.0.0
-        self.http_port: int = _get_env("HTTP_PORT", required=True, cast=int)  # e.g., 8080
+def _to_float(name: str, v: str) -> float:
+    try:
+        return float(v)
+    except Exception:
+        raise ConfigError(f"Invalid float for {name}: {v}")
 
-        # Device connection
-        self.device_host: str = _get_env("DEVICE_HOST", required=True, cast=str)
-        self.device_port: int = _get_env("DEVICE_PORT", required=True, cast=int)
 
-        # Timeouts and retry/backoff settings (milliseconds)
-        self.connect_timeout_ms: int = _get_env("CONNECT_TIMEOUT_MS", required=True, cast=int)
-        self.read_timeout_ms: int = _get_env("READ_TIMEOUT_MS", required=True, cast=int)
-        self.retry_backoff_min_ms: int = _get_env("RETRY_BACKOFF_MS_MIN", required=True, cast=int)
-        self.retry_backoff_max_ms: int = _get_env("RETRY_BACKOFF_MS_MAX", required=True, cast=int)
+def _normalize_base_url(url: str) -> str:
+    # Ensure no trailing slash
+    return url[:-1] if url.endswith('/') else url
 
-        # Streaming heartbeat seconds (to keep HTTP connections alive when idle)
-        self.stream_heartbeat_s: int = _get_env("STREAM_HEARTBEAT_S", required=True, cast=int)
 
-    def dump(self) -> dict:
-        return {
-            "http_host": self.http_host,
-            "http_port": self.http_port,
-            "device_host": self.device_host,
-            "device_port": self.device_port,
-            "connect_timeout_ms": self.connect_timeout_ms,
-            "read_timeout_ms": self.read_timeout_ms,
-            "retry_backoff_min_ms": self.retry_backoff_min_ms,
-            "retry_backoff_max_ms": self.retry_backoff_max_ms,
-            "stream_heartbeat_s": self.stream_heartbeat_s,
-        }
+def _normalize_path(path: str) -> str:
+    # Ensure leading slash and no trailing slash (server/device paths typically don't require trailing slash)
+    if not path.startswith('/'):
+        path = '/' + path
+    if len(path) > 1 and path.endswith('/'):
+        path = path[:-1]
+    return path
 
 
 def load_config() -> Config:
-    try:
-        return Config()
-    except ConfigError as e:
-        sys.stderr.write(str(e) + "\n")
-        sys.exit(2)
+    http_host = _require_env("HTTP_HOST")
+    http_port = _to_int("HTTP_PORT", _require_env("HTTP_PORT"))
+
+    device_base_url = _normalize_base_url(_require_env("DEVICE_BASE_URL"))
+    device_set_velocity_path = _normalize_path(_require_env("DEVICE_SET_VELOCITY_PATH"))
+    device_telemetry_path = _normalize_path(_require_env("DEVICE_TELEMETRY_PATH"))
+
+    request_timeout_secs = _to_float("REQUEST_TIMEOUT_SECS", _require_env("REQUEST_TIMEOUT_SECS"))
+    poll_interval_secs = _to_float("POLL_INTERVAL_SECS", _require_env("POLL_INTERVAL_SECS"))
+    backoff_min_secs = _to_float("BACKOFF_MIN_SECS", _require_env("BACKOFF_MIN_SECS"))
+    backoff_max_secs = _to_float("BACKOFF_MAX_SECS", _require_env("BACKOFF_MAX_SECS"))
+
+    max_speed_mps = _to_float("MAX_SPEED_MPS", _require_env("MAX_SPEED_MPS"))
+
+    device_bearer_token = os.getenv("DEVICE_BEARER_TOKEN")
+    device_username = os.getenv("DEVICE_USERNAME")
+    device_password = os.getenv("DEVICE_PASSWORD")
+
+    # If username provided, password must also be provided (and vice versa)
+    if (device_username and not device_password) or (device_password and not device_username):
+        raise ConfigError("DEVICE_USERNAME and DEVICE_PASSWORD must be both set or both unset")
+
+    return Config(
+        http_host=http_host,
+        http_port=http_port,
+        device_base_url=device_base_url,
+        device_set_velocity_path=device_set_velocity_path,
+        device_telemetry_path=device_telemetry_path,
+        request_timeout_secs=request_timeout_secs,
+        poll_interval_secs=poll_interval_secs,
+        backoff_min_secs=backoff_min_secs,
+        backoff_max_secs=backoff_max_secs,
+        max_speed_mps=max_speed_mps,
+        device_bearer_token=device_bearer_token,
+        device_username=device_username,
+        device_password=device_password,
+    )
