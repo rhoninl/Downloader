@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deviceshifu-usb-camera
+  namespace: deviceshifu
+type: Opaque
+data:
+  streamKey: TjQwamwwS29sbnBrM2ctU1NFSk1wUS1GMTdobExWQg==
+---
+# Deployment for Insta360 Link2 USB Camera DeviceShifu
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deviceshifu-usb-camera
+  namespace: deviceshifu
+  labels:
+    app: deviceshifu-usb-camera
+    workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+    workspace_name: "345"
+spec:
+  selector:
+    matchLabels:
+      app: deviceshifu-usb-camera
+      workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+      workspace_name: "345"
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-usb-camera
+        workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+        workspace_name: "345"
+    spec:
+      containers:
+        - name: deviceshifu
+          image: registry.test.shifu.dev/edgenesis/deviceshifu-insta360-link2:v0.0.1
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "usb-camera"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+            - name: NATS_SERVER
+              value: "nats://broker.test.edgenesis.net:4222"
+            - name: NATS_PREFIX
+              value: "345.usb-camera"
+            - name: AGORA_STREAMKEY
+              valueFrom: 
+                secretKeyRef:
+                  name: deviceshifu-usb-camera
+                  key: streamKey
+            - name: AGORA_REGION
+              value: "ap"
+          volumeMounts:
+            - name: deviceshifu-config
+              mountPath: "/etc/edgedevice/config"
+              readOnly: true
+            - name: dev
+              mountPath: "/dev"
+          securityContext:
+            privileged: true
+      volumes:
+        - name: deviceshifu-config
+          configMap:
+            name: deviceshifu-usb-camera-configmap
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+      serviceAccountName: edgedevice-sa
+---
+# ConfigMap for device configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deviceshifu-usb-camera-configmap
+  namespace: deviceshifu
+  labels:
+    app: deviceshifu-usb-camera
+    workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+    workspace_name: "345"
+data:
+  driverProperties: |
+    driverSku: Insta360-Link2
+    driverImage: edgenesis/deviceshifu-insta360-link2:v0.0.1
+  instructions: |
+    .stream.control:
+    .pan:
+    .tilt:
+  telemetries: |
+---
+# EdgeDevice Custom Resource
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: usb-camera
+  namespace: devices
+  labels:
+    workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+    workspace_name: "345"
+spec:
+  sku: "Insta360 Link2"
+  connection: USB
+  address: "0"
+  protocol: USB
