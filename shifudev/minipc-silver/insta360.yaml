@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deviceshifu-insta360
+  namespace: deviceshifu
+type: Opaque
+data:
+  streamKey: cnVwc1VHYTM5OHNfaHFINzF4OWozMXlaYTd5cnpxUQ==
+---
+# Deployment for Insta360 Link2 USB Camera DeviceShifu
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deviceshifu-insta360
+  namespace: deviceshifu
+  labels:
+    app: deviceshifu-insta360
+    workspace_id: "133b8bc2-9f42-42ff-81bb-5857ed80fc89"
+    workspace_name: "minipc-silver"
+spec:
+  selector:
+    matchLabels:
+      app: deviceshifu-insta360
+      workspace_id: "133b8bc2-9f42-42ff-81bb-5857ed80fc89"
+      workspace_name: "minipc-silver"
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-insta360
+        workspace_id: "133b8bc2-9f42-42ff-81bb-5857ed80fc89"
+        workspace_name: "minipc-silver"
+    spec:
+      containers:
+        - name: deviceshifu
+          image: registry.test.shifu.dev/edgenesis/deviceshifu-insta360-link2:v0.0.1
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "insta360"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+            - name: NATS_SERVER
+              value: "nats://broker.test.edgenesis.net:4222"
+            - name: NATS_PREFIX
+              value: "minipc-silver.insta360"
+            - name: AGORA_STREAMKEY
+              valueFrom: 
+                secretKeyRef:
+                  name: deviceshifu-insta360
+                  key: streamKey
+            - name: AGORA_REGION
+              value: "ap"
+          volumeMounts:
+            - name: deviceshifu-config
+              mountPath: "/etc/edgedevice/config"
+              readOnly: true
+            - name: dev
+              mountPath: "/dev"
+          securityContext:
+            privileged: true
+      volumes:
+        - name: deviceshifu-config
+          configMap:
+            name: deviceshifu-insta360-configmap
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+      serviceAccountName: edgedevice-sa
+---
+# ConfigMap for device configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deviceshifu-insta360-configmap
+  namespace: deviceshifu
+  labels:
+    app: deviceshifu-insta360
+    workspace_id: "133b8bc2-9f42-42ff-81bb-5857ed80fc89"
+    workspace_name: "minipc-silver"
+data:
+  driverProperties: |
+    driverSku: Insta360-Link2
+    driverImage: edgenesis/deviceshifu-insta360-link2:v0.0.1
+  instructions: |
+    .stream.control:
+    .pan:
+    .tilt:
+  telemetries: |
+---
+# EdgeDevice Custom Resource
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: insta360
+  namespace: devices
+  labels:
+    workspace_id: "133b8bc2-9f42-42ff-81bb-5857ed80fc89"
+    workspace_name: "minipc-silver"
+spec:
+  sku: "Insta360 Link2"
+  connection: USB
+  address: "0"
+  protocol: USB
