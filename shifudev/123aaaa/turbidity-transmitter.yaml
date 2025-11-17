@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deviceshifu-turbidity-transmitter-config
+  namespace: deviceshifu
+data:
+  driverProperties: |
+    driverSku: "modbus-tcp"
+    driverImage: "deviceshifu-modbus-tcp:latest"
+  instructions: |
+    instructions:
+      turbidity_value:
+        protocolPropertyList:
+          RegisterAddress: "0"
+          FunctionCode: "inputregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "R"
+      temperature:
+        protocolPropertyList:
+          RegisterAddress: "1"
+          FunctionCode: "inputregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "R"
+      turbidity_offset:
+        protocolPropertyList:
+          RegisterAddress: "80"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+      temperature_offset:
+        protocolPropertyList:
+          RegisterAddress: "81"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "int16"
+          Operation: "RW"
+      calibration_control:
+        protocolPropertyList:
+          RegisterAddress: "4112"
+          FunctionCode: "writeregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "W"
+      calibration_parameter:
+        protocolPropertyList:
+          RegisterAddress: "4113"
+          FunctionCode: "writeregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "W"
+      device_address:
+        protocolPropertyList:
+          RegisterAddress: "2000"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+      baudrate_setting:
+        protocolPropertyList:
+          RegisterAddress: "2001"
+          FunctionCode: "holdingregister"
+          Quantity: 1
+          DataType: "uint16"
+          Operation: "RW"
+
+  telemetries: |
+    telemetrySettings:
+    telemetries:
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deviceshifu-turbidity-transmitter
+  namespace: deviceshifu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deviceshifu-turbidity-transmitter
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-turbidity-transmitter
+    spec:
+      serviceAccountName: edgedevice-sa
+      containers:
+        - name: deviceshifu
+          image: registry.test.shifu.dev/edgenesis/deviceshifu-http-modbustcp:v0.0.2
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "deviceshifu-turbidity-transmitter"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+            - name: MODBUS_SLAVE_ID
+              value: "1"
+            - name: MODBUS_TIMEOUT
+              value: "5"
+            - name: PLC_USE_OFFSET
+              value: "false"
+            - name: HTTP_PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: "info"
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/edgedevice/config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: deviceshifu-turbidity-transmitter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deviceshifu-turbidity-transmitter
+  namespace: deviceshifu
+spec:
+  selector:
+    app: deviceshifu-turbidity-transmitter
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: deviceshifu-turbidity-transmitter
+  namespace: devices
+spec:
+  sku: "deviceshifu-turbidity-transmitter"
+  connection: Ethernet
+  address: "192.168.0.81:10123"
+  protocol: "ModbusTCP"
