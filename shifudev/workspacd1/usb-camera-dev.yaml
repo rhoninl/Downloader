@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: <no value>-configmap
+  namespace: deviceshifu
+  annotations:
+    workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
+    workspace.name: "workspacd1"
+data:
+  driverProperties: |
+    driverSku: <no value>
+    driverImage: edgenesis/usb-camera:v0.0.1
+  instructions: |
+    instructions:
+      video:
+      capture:
+      probe:
+  telemetries: |
+    telemetries:
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: deviceshifu-<no value>
+    workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
+    workspace.name: "workspacd1"
+  name: deviceshifu-<no value>
+  namespace: deviceshifu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deviceshifu-<no value>
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-<no value>
+        workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
+        workspace.name: "workspacd1"
+    spec:
+      containers:
+        - image: edgehub/deviceshifu-http-http:nightly
+          name: deviceshifu-<no value>
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: deviceshifu-config
+              mountPath: "/etc/edgedevice/config"
+              readOnly: true
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "edgedevice-<no value>"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+        - image: edgenesis/usb-camera:v0.0.3
+          securityContext:
+            privileged: true
+          name: camera-python
+          env:
+            - name: CAMERA_WIDTH
+              value: "<no value>"
+            - name: CAMERA_HEIGHT
+              value: "<no value>"
+            - name: VIDEONUMBER
+              value: "<no value>"
+          volumeMounts:
+            - name: video
+              mountPath: "/dev"
+          resources:
+      volumes:
+        - name: deviceshifu-config
+          configMap:
+            name: <no value>-configmap
+        - name: video
+          hostPath:
+            path: /dev
+      serviceAccountName: edgedevice-sa
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: deviceshifu-<no value>
+    workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
+    workspace.name: "workspacd1"
+  name: deviceshifu-<no value>
+  namespace: deviceshifu
+spec:
+  ports:
+    - port: 80
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    app: deviceshifu-<no value>
+  type: ClusterIP
+---
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: edgedevice-<no value>
+  namespace: devices
+  annotations:
+    workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
+    workspace.name: "workspacd1"
+spec:
+  sku: "<no value>"
+  connection: Ethernet
+  address: 0.0.0.0:5001
+  protocol: HTTP
