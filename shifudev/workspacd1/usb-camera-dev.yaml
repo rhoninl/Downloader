@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: <no value>-configmap
+  name: usb-camera-dev-configmap
   namespace: deviceshifu
   annotations:
     workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
     workspace.name: "workspacd1"
 data:
   driverProperties: |
-    driverSku: <no value>
+    driverSku: HTTP USB Camera Device
     driverImage: edgenesis/usb-camera:v0.0.1
   instructions: |
     instructions:
@@ -22,26 +22,26 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
-    app: deviceshifu-<no value>
+    app: deviceshifu-usb-camera-dev
     workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
     workspace.name: "workspacd1"
-  name: deviceshifu-<no value>
+  name: deviceshifu-usb-camera-dev
   namespace: deviceshifu
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: deviceshifu-<no value>
+      app: deviceshifu-usb-camera-dev
   template:
     metadata:
       labels:
-        app: deviceshifu-<no value>
+        app: deviceshifu-usb-camera-dev
         workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
         workspace.name: "workspacd1"
     spec:
       containers:
         - image: edgehub/deviceshifu-http-http:nightly
-          name: deviceshifu-<no value>
+          name: deviceshifu-usb-camera-dev
           ports:
             - containerPort: 8080
           volumeMounts:
@@ -50,7 +50,7 @@ spec:
               readOnly: true
           env:
             - name: EDGEDEVICE_NAME
-              value: "edgedevice-<no value>"
+              value: "edgedevice-usb-camera-dev"
             - name: EDGEDEVICE_NAMESPACE
               value: "devices"
         - image: edgenesis/usb-camera:v0.0.3
@@ -59,11 +59,11 @@ spec:
           name: camera-python
           env:
             - name: CAMERA_WIDTH
-              value: "<no value>"
+              value: "640"
             - name: CAMERA_HEIGHT
-              value: "<no value>"
+              value: "480"
             - name: VIDEONUMBER
-              value: "<no value>"
+              value: "0"
           volumeMounts:
             - name: video
               mountPath: "/dev"
@@ -71,7 +71,7 @@ spec:
       volumes:
         - name: deviceshifu-config
           configMap:
-            name: <no value>-configmap
+            name: usb-camera-dev-configmap
         - name: video
           hostPath:
             path: /dev
@@ -81,10 +81,10 @@ apiVersion: v1
 kind: Service
 metadata:
   labels:
-    app: deviceshifu-<no value>
+    app: deviceshifu-usb-camera-dev
     workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
     workspace.name: "workspacd1"
-  name: deviceshifu-<no value>
+  name: deviceshifu-usb-camera-dev
   namespace: deviceshifu
 spec:
   ports:
@@ -92,19 +92,19 @@ spec:
       protocol: TCP
       targetPort: 8080
   selector:
-    app: deviceshifu-<no value>
+    app: deviceshifu-usb-camera-dev
   type: ClusterIP
 ---
 apiVersion: shifu.edgenesis.io/v1alpha1
 kind: EdgeDevice
 metadata:
-  name: edgedevice-<no value>
+  name: edgedevice-usb-camera-dev
   namespace: devices
   annotations:
     workspace.id: "1157a0c4-8c1a-497a-945f-0569b6cded55"
     workspace.name: "workspacd1"
 spec:
-  sku: "<no value>"
+  sku: "HTTP USB Camera Device"
   connection: Ethernet
   address: 0.0.0.0:5001
   protocol: HTTP
