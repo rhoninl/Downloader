@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app: deviceshifu-thermo-hygrometer
+    workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+  name: deviceshifu-thermo-hygrometer-configmap
+  namespace: deviceshifu
+data:
+  driverProperties: |
+    driverSku: "TAS-WS-R0020"
+    driverImage:
+  instructions: |
+    instructions:
+      th:
+      Temperature:
+      Humidity:
+  telemetries: |
+    telemetries:
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: deviceshifu-thermo-hygrometer
+    workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+  name: deviceshifu-thermo-hygrometer-service
+  namespace: deviceshifu
+spec:
+  ports:
+  - name: http-service
+    port: 80
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: deviceshifu-thermo-hygrometer-deployment
+  type: LoadBalancer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: deviceshifu-thermo-hygrometer
+    workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+  name: deviceshifu-thermo-hygrometer-deployment
+  namespace: deviceshifu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deviceshifu-thermo-hygrometer-deployment
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-thermo-hygrometer-deployment
+    spec:
+      containers:
+        - image: edgehub/deviceshifu-http-http:v0.64.0
+          name: deviceshifu-http
+          ports:
+          - containerPort: 8080
+          volumeMounts:
+            - name: deviceshifu-config
+              mountPath: /etc/edgedevice/config
+              readOnly: true
+          env:
+          - name: EDGEDEVICE_NAME
+            value: "deviceshifu-thermo-hygrometer-edgedevice"
+          - name: EDGEDEVICE_NAMESPACE
+            value: "devices"
+        - name: shifu-driver
+          image: edgenesis/modbus-temperature-humdity:v0.0.1
+          ports:
+            - containerPort: 9090
+              protocol: TCP
+          env:
+            - name: DEVICE_ADDRESS
+              value: "192.168.0.80:10123"
+      volumes:
+        - name: deviceshifu-config
+          configMap:
+            name: deviceshifu-thermo-hygrometer-configmap
+      serviceAccountName: edgedevice-sa
+---
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  labels:
+    app: deviceshifu-thermo-hygrometer
+    workspace_id: "3e29c110-6fb7-43e4-9738-c24b20c22ef6"
+  name: deviceshifu-thermo-hygrometer-edgedevice
+  namespace: devices
+spec:
+  sku: "TAS-WS-R0020"
+  connection: "Ethernet"
+  address: "0.0.0.0:9090"
+  protocol: "HTTP"
