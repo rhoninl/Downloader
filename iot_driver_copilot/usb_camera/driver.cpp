@@ -1,778 +1,613 @@
 #include <arpa/inet.h>
-#include <errno.h>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <cstring>
 #include <fcntl.h>
+#include <iostream>
 #include <linux/videodev2.h>
-#include <netdb.h>
+#include <mutex>
 #include <netinet/in.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
-
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <cstdint>
-#include <functional>
-#include <iomanip>
-#include <iostream>
-#include <map>
-#include <mutex>
-#include <sstream>
-#include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
-// ========================= Config =========================
-struct Config {
-    std::string http_host = "0.0.0.0";
-    uint16_t http_port = 8080;
+#include "config.h"
 
-    std::string camera_device = "/dev/video0";
-    int camera_width = 640;
-    int camera_height = 480;
-    int camera_fps = 30;
+// -------------------- Logging --------------------
+enum class LogLevel { TRACE = 0, DEBUG = 1, INFO = 2, WARN = 3, ERROR = 4 };
 
-    int capture_timeout_ms = 1000; // select timeout
-    int retry_max_attempts = 0;     // 0 = infinite
-    int backoff_initial_ms = 500;
-    int backoff_max_ms = 5000;
-};
+static LogLevel GLOBAL_LOG_LEVEL = LogLevel::INFO;
 
-static std::atomic<bool> g_shutdown{false};
-
-static std::string now_str() {
+static std::string nowString() {
     using namespace std::chrono;
     auto now = system_clock::now();
     auto t = system_clock::to_time_t(now);
-    auto tm = *std::localtime(&t);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
     auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setw(3) << std::setfill('0') << ms.count();
-    return oss.str();
+    char out[80];
+    std::snprintf(out, sizeof(out), "%s.%03lld", buf, (long long)ms.count());
+    return std::string(out);
 }
 
-static void logf(const char* level, const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    fprintf(stderr, "[%s] [%s] ", now_str().c_str(), level);
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    va_end(args);
+static void log(LogLevel lvl, const std::string &msg) {
+    if ((int)lvl < (int)GLOBAL_LOG_LEVEL) return;
+    const char *name = "INFO";
+    switch (lvl) {
+        case LogLevel::TRACE: name = "TRACE"; break;
+        case LogLevel::DEBUG: name = "DEBUG"; break;
+        case LogLevel::INFO: name = "INFO"; break;
+        case LogLevel::WARN: name = "WARN"; break;
+        case LogLevel::ERROR: name = "ERROR"; break;
+    }
+    std::cerr << nowString() << " [" << name << "] " << msg << std::endl;
 }
 
-static std::string getenv_str(const char* key, const char* def) {
-    const char* v = getenv(key);
-    if (v && *v) return std::string(v);
-    return std::string(def);
-}
-
-static int getenv_int(const char* key, int def) {
-    const char* v = getenv(key);
-    if (!v || !*v) return def;
-    char* end = nullptr;
-    long val = strtol(v, &end, 10);
-    if (end == v || *end != '\0') return def;
-    return (int)val;
-}
-
-static uint16_t getenv_u16(const char* key, uint16_t def) {
-    const char* v = getenv(key);
-    if (!v || !*v) return def;
-    char* end = nullptr;
-    long val = strtol(v, &end, 10);
-    if (end == v || *end != '\0') return def;
-    if (val < 0 || val > 65535) return def;
-    return (uint16_t)val;
-}
-
-static Config load_config() {
-    Config c;
-    c.http_host = getenv_str("HTTP_HOST", "0.0.0.0");
-    c.http_port = getenv_u16("HTTP_PORT", 8080);
-
-    c.camera_device = getenv_str("CAMERA_DEVICE", "/dev/video0");
-    c.camera_width = getenv_int("CAMERA_WIDTH", 640);
-    c.camera_height = getenv_int("CAMERA_HEIGHT", 480);
-    c.camera_fps = getenv_int("CAMERA_FPS", 30);
-
-    c.capture_timeout_ms = getenv_int("CAPTURE_TIMEOUT_MS", 1000);
-    c.retry_max_attempts = getenv_int("RETRY_MAX_ATTEMPTS", 0);
-    c.backoff_initial_ms = getenv_int("BACKOFF_INITIAL_MS", 500);
-    c.backoff_max_ms = getenv_int("BACKOFF_MAX_MS", 5000);
-    return c;
-}
-
-// ========================= V4L2 Camera =========================
-struct MMapBuffer {
-    void* start = nullptr;
+// -------------------- UVC (V4L2) Device --------------------
+struct Buffer {
+    void *start = nullptr;
     size_t length = 0;
 };
 
-class V4L2Camera {
+class UVCDevice {
 public:
-    V4L2Camera() {}
-    ~V4L2Camera() { closeDevice(); }
+    UVCDevice(const Config &cfg)
+        : devPath(cfg.uvc_device), width(cfg.uvc_width), height(cfg.uvc_height), fps(cfg.uvc_fps),
+          readTimeoutMs(cfg.read_timeout_ms), retryBaseMs(cfg.retry_base_ms), retryMaxMs(cfg.retry_max_ms) {}
 
-    bool openDevice(const std::string& dev) {
-        device_ = dev;
-        fd_ = ::open(dev.c_str(), O_RDWR | O_NONBLOCK, 0);
-        if (fd_ < 0) {
-            logf("ERROR", "open(%s) failed: %s", dev.c_str(), strerror(errno));
-            return false;
-        }
-        struct v4l2_capability cap;
-        if (xioctl(fd_, VIDIOC_QUERYCAP, &cap) == -1) {
-            logf("ERROR", "VIDIOC_QUERYCAP failed: %s", strerror(errno));
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-            logf("ERROR", "%s is not a video capture device", dev.c_str());
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-            logf("ERROR", "%s does not support streaming I/O", dev.c_str());
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        return true;
-    }
-
-    bool configureFormat(int width, int height, int fps) {
-        // Try MJPEG
-        struct v4l2_format fmt;
-        memset(&fmt, 0, sizeof(fmt));
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        fmt.fmt.pix.width = width;
-        fmt.fmt.pix.height = height;
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-        fmt.fmt.pix.field = V4L2_FIELD_ANY;
-        if (xioctl(fd_, VIDIOC_S_FMT, &fmt) == -1) {
-            logf("ERROR", "VIDIOC_S_FMT failed: %s", strerror(errno));
-            return false;
-        }
-        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
-            char fourcc[5];
-            fourcc[0] = (char)(fmt.fmt.pix.pixelformat & 0xFF);
-            fourcc[1] = (char)((fmt.fmt.pix.pixelformat >> 8) & 0xFF);
-            fourcc[2] = (char)((fmt.fmt.pix.pixelformat >> 16) & 0xFF);
-            fourcc[3] = (char)((fmt.fmt.pix.pixelformat >> 24) & 0xFF);
-            fourcc[4] = '\0';
-            logf("ERROR", "Device does not support MJPEG; got pixel format %s. MJPEG required for HTTP streaming.", fourcc);
-            return false;
-        }
-        width_ = fmt.fmt.pix.width;
-        height_ = fmt.fmt.pix.height;
-
-        // Set frame rate
-        struct v4l2_streamparm sp;
-        memset(&sp, 0, sizeof(sp));
-        sp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        sp.parm.capture.timeperframe.numerator = 1;
-        sp.parm.capture.timeperframe.denominator = fps > 0 ? fps : 30;
-        if (xioctl(fd_, VIDIOC_S_PARM, &sp) == -1) {
-            logf("WARN", "VIDIOC_S_PARM failed: %s (continuing with default)", strerror(errno));
-        }
-        fps_ = sp.parm.capture.timeperframe.denominator / (sp.parm.capture.timeperframe.numerator ? sp.parm.capture.timeperframe.numerator : 1);
-        return true;
-    }
-
-    bool initMMap(unsigned int buffer_count = 4) {
-        struct v4l2_requestbuffers req;
-        memset(&req, 0, sizeof(req));
-        req.count = buffer_count;
-        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        req.memory = V4L2_MEMORY_MMAP;
-        if (xioctl(fd_, VIDIOC_REQBUFS, &req) == -1) {
-            logf("ERROR", "VIDIOC_REQBUFS failed: %s", strerror(errno));
-            return false;
-        }
-        if (req.count < 2) {
-            logf("ERROR", "Insufficient buffer memory on %s", device_.c_str());
-            return false;
-        }
-        buffers_.resize(req.count);
-        for (unsigned int n = 0; n < req.count; ++n) {
-            struct v4l2_buffer buf;
-            memset(&buf, 0, sizeof(buf));
-            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = V4L2_MEMORY_MMAP;
-            buf.index = n;
-            if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) == -1) {
-                logf("ERROR", "VIDIOC_QUERYBUF failed: %s", strerror(errno));
-                return false;
-            }
-            buffers_[n].length = buf.length;
-            buffers_[n].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buf.m.offset);
-            if (buffers_[n].start == MAP_FAILED) {
-                logf("ERROR", "mmap failed: %s", strerror(errno));
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool startStreaming() {
-        for (size_t i = 0; i < buffers_.size(); ++i) {
-            struct v4l2_buffer buf;
-            memset(&buf, 0, sizeof(buf));
-            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = V4L2_MEMORY_MMAP;
-            buf.index = i;
-            if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
-                logf("ERROR", "VIDIOC_QBUF failed: %s", strerror(errno));
-                return false;
-            }
-        }
-        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (xioctl(fd_, VIDIOC_STREAMON, &type) == -1) {
-            logf("ERROR", "VIDIOC_STREAMON failed: %s", strerror(errno));
-            return false;
-        }
-        streaming_ = true;
-        return true;
-    }
-
-    bool stopStreaming() {
-        if (!streaming_) return true;
-        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (xioctl(fd_, VIDIOC_STREAMOFF, &type) == -1) {
-            logf("WARN", "VIDIOC_STREAMOFF failed: %s", strerror(errno));
-        }
-        streaming_ = false;
-        return true;
-    }
-
-    void closeDevice() {
-        stopStreaming();
-        for (auto &b : buffers_) {
-            if (b.start && b.start != MAP_FAILED) munmap(b.start, b.length);
-        }
-        buffers_.clear();
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-    }
-
-    // Return: 1 on frame captured, 0 on timeout, -1 on error
-    int captureFrame(std::vector<uint8_t>& out, int timeout_ms) {
-        if (fd_ < 0) return -1;
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(fd_, &fds);
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        int r = select(fd_ + 1, &fds, NULL, NULL, &tv);
-        if (r == -1) {
-            if (errno == EINTR) return 0;
-            logf("ERROR", "select error: %s", strerror(errno));
-            return -1;
-        }
-        if (r == 0) {
-            return 0; // timeout
-        }
-        struct v4l2_buffer buf;
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        if (xioctl(fd_, VIDIOC_DQBUF, &buf) == -1) {
-            if (errno == EAGAIN) return 0;
-            logf("ERROR", "VIDIOC_DQBUF failed: %s", strerror(errno));
-            return -1;
-        }
-        if (buf.index >= buffers_.size()) {
-            logf("ERROR", "buffer index out of range");
-            return -1;
-        }
-        void* src = buffers_[buf.index].start;
-        size_t len = buf.bytesused;
-        out.resize(len);
-        memcpy(out.data(), src, len);
-        if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
-            logf("ERROR", "VIDIOC_QBUF requeue failed: %s", strerror(errno));
-            return -1;
-        }
-        return 1;
-    }
-
-    int width() const { return width_; }
-    int height() const { return height_; }
-    int fps() const { return fps_; }
-    const std::string& device() const { return device_; }
-
-private:
-    int fd_ = -1;
-    std::string device_;
-    std::vector<MMapBuffer> buffers_;
-    bool streaming_ = false;
-    int width_ = 0;
-    int height_ = 0;
-    int fps_ = 0;
-
-    static int xioctl(int fd, int request, void* arg) {
-        int r;
-        do { r = ioctl(fd, request, arg); } while (r == -1 && errno == EINTR);
-        return r;
-    }
-};
-
-// ========================= Camera Manager =========================
-class CameraManager {
-public:
-    explicit CameraManager(const Config& cfg) : cfg_(cfg) {}
-    ~CameraManager() { stop(); }
+    ~UVCDevice() { stop(); }
 
     bool start() {
-        std::lock_guard<std::mutex> lk(state_mtx_);
-        if (running_) {
-            logf("INFO", "Camera already running");
+        std::lock_guard<std::mutex> lk(stateMutex);
+        if (worker.joinable()) {
+            log(LogLevel::INFO, "UVCDevice already started");
             return true;
         }
-        stop_requested_ = false;
-        worker_ = std::thread(&CameraManager::captureLoop, this);
-        running_ = true;
+        stopFlag = false;
+        worker = std::thread(&UVCDevice::run, this);
+        log(LogLevel::INFO, "UVCDevice worker started");
         return true;
     }
 
     void stop() {
         {
-            std::lock_guard<std::mutex> lk(state_mtx_);
-            if (!running_) return;
-            stop_requested_ = true;
+            std::lock_guard<std::mutex> lk(stateMutex);
+            stopFlag = true;
         }
-        if (worker_.joinable()) worker_.join();
-        running_ = false;
+        if (worker.joinable()) worker.join();
+        cleanup();
     }
 
-    bool isConnected() const { return connected_.load(); }
+    bool isWorkerStarted() const {
+        return worker.joinable();
+    }
 
-    // Latest frame copy
-    bool getLatestFrame(std::vector<uint8_t>& out, uint64_t& seq_out, std::chrono::steady_clock::time_point& ts_out) {
-        std::lock_guard<std::mutex> lk(frame_mtx_);
-        if (frame_seq_ == 0 || latest_frame_.empty()) return false;
-        out = latest_frame_;
-        seq_out = frame_seq_;
-        ts_out = last_update_;
+    bool isStreaming() const {
+        return streaming.load();
+    }
+
+    // Wait for a new frame sequence different from lastSeq.
+    // Returns false if stop requested; true if a new frame available.
+    bool waitForFrame(uint64_t lastSeq, std::vector<uint8_t> &out, uint64_t &newSeq) {
+        std::unique_lock<std::mutex> lk(frameMutex);
+        frameCond.wait(lk, [&]{ return stopFlag || frameSeq != lastSeq; });
+        if (stopFlag) return false;
+        out = latestFrame;
+        newSeq = frameSeq;
         return true;
     }
 
-    // Wait for new frame (blocking up to wait_ms)
-    bool waitForNewFrame(uint64_t last_seq, std::vector<uint8_t>& out, uint64_t& seq_out, std::chrono::steady_clock::time_point& ts_out, int wait_ms) {
-        std::unique_lock<std::mutex> lk(frame_mtx_);
-        if (frame_seq_ == 0) {
-            frame_cv_.wait_for(lk, std::chrono::milliseconds(wait_ms));
-        } else {
-            frame_cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&]{ return frame_seq_ != last_seq; });
-        }
-        if (latest_frame_.empty() || frame_seq_ == last_seq) return false;
-        out = latest_frame_;
-        seq_out = frame_seq_;
-        ts_out = last_update_;
+    // Non-blocking: copy the latest frame.
+    bool getLatestFrame(std::vector<uint8_t> &out, uint64_t &seqOut) {
+        std::lock_guard<std::mutex> lk(frameMutex);
+        if (latestFrame.empty()) return false;
+        out = latestFrame;
+        seqOut = frameSeq;
         return true;
     }
 
-    int width() const { return width_; }
-    int height() const { return height_; }
-    int fps() const { return fps_; }
-    std::string devicePath() const { return cfg_.camera_device; }
+    std::string lastUpdateString() const {
+        std::lock_guard<std::mutex> lk(frameMutex);
+        return lastUpdateStr;
+    }
 
 private:
-    Config cfg_;
-    std::atomic<bool> connected_{false};
-    std::atomic<bool> running_{false};
-    std::atomic<bool> stop_requested_{false};
-    std::thread worker_;
+    std::string devPath;
+    int width;
+    int height;
+    int fps;
+    int readTimeoutMs;
+    int retryBaseMs;
+    int retryMaxMs;
 
-    // frame buffer
-    std::mutex frame_mtx_;
-    std::condition_variable frame_cv_;
-    std::vector<uint8_t> latest_frame_;
-    std::chrono::steady_clock::time_point last_update_{};
-    uint64_t frame_seq_ = 0;
+    int fd = -1;
+    std::vector<Buffer> buffers;
+    std::atomic<bool> streaming{false};
+    std::atomic<bool> stopFlag{false};
+    std::thread worker;
+    std::mutex stateMutex;
 
-    // state
-    std::mutex state_mtx_;
-    int width_ = 0;
-    int height_ = 0;
-    int fps_ = 0;
+    std::mutex frameMutex;
+    std::condition_variable frameCond;
+    std::vector<uint8_t> latestFrame;
+    uint64_t frameSeq = 0;
+    std::string lastUpdateStr;
 
-    void captureLoop() {
-        int attempts = 0;
-        int backoff = cfg_.backoff_initial_ms;
-        while (!stop_requested_.load() && !g_shutdown.load()) {
-            V4L2Camera cam;
-            if (!cam.openDevice(cfg_.camera_device)) {
-                attempts++;
-                if (cfg_.retry_max_attempts > 0 && attempts >= cfg_.retry_max_attempts) {
-                    logf("ERROR", "Max retry attempts reached. Stopping camera thread.");
-                    break;
-                }
-                logf("WARN", "Retrying open in %d ms (attempt %d)", backoff, attempts);
-                sleep_ms(backoff);
-                backoff = std::min(cfg_.backoff_max_ms, backoff * 2);
+    void run() {
+        int backoffMs = retryBaseMs;
+        while (!stopFlag) {
+            if (!openAndConfigure()) {
+                log(LogLevel::ERROR, "Failed to open/configure UVC device; retry in " + std::to_string(backoffMs) + " ms");
+                sleepMs(backoffMs);
+                backoffMs = std::min(backoffMs * 2, retryMaxMs);
                 continue;
             }
-            if (!cam.configureFormat(cfg_.camera_width, cfg_.camera_height, cfg_.camera_fps)) {
-                logf("ERROR", "Failed to configure format (MJPEG %dx%d @%dfps).", cfg_.camera_width, cfg_.camera_height, cfg_.camera_fps);
-                attempts++;
-                cam.closeDevice();
-                if (cfg_.retry_max_attempts > 0 && attempts >= cfg_.retry_max_attempts) {
-                    logf("ERROR", "Max retry attempts reached. Stopping camera thread.");
-                    break;
-                }
-                logf("WARN", "Retrying configure in %d ms (attempt %d)", backoff, attempts);
-                sleep_ms(backoff);
-                backoff = std::min(cfg_.backoff_max_ms, backoff * 2);
+            backoffMs = retryBaseMs; // reset on success
+            log(LogLevel::INFO, "UVC device configured; starting capture loop");
+
+            if (!streamOn()) {
+                log(LogLevel::ERROR, "VIDIOC_STREAMON failed; retry in " + std::to_string(backoffMs) + " ms");
+                cleanup();
+                sleepMs(backoffMs);
+                backoffMs = std::min(backoffMs * 2, retryMaxMs);
                 continue;
             }
-            if (!cam.initMMap(4)) {
-                attempts++;
-                cam.closeDevice();
-                if (cfg_.retry_max_attempts > 0 && attempts >= cfg_.retry_max_attempts) {
-                    logf("ERROR", "Max retry attempts reached. Stopping camera thread.");
-                    break;
-                }
-                logf("WARN", "Retrying initMMap in %d ms (attempt %d)", backoff, attempts);
-                sleep_ms(backoff);
-                backoff = std::min(cfg_.backoff_max_ms, backoff * 2);
-                continue;
-            }
-            if (!cam.startStreaming()) {
-                attempts++;
-                cam.closeDevice();
-                if (cfg_.retry_max_attempts > 0 && attempts >= cfg_.retry_max_attempts) {
-                    logf("ERROR", "Max retry attempts reached. Stopping camera thread.");
-                    break;
-                }
-                logf("WARN", "Retrying startStreaming in %d ms (attempt %d)", backoff, attempts);
-                sleep_ms(backoff);
-                backoff = std::min(cfg_.backoff_max_ms, backoff * 2);
-                continue;
-            }
+            streaming.store(true);
+            captureLoop();
+            streaming.store(false);
+            streamOff();
+            cleanup();
 
-            // Reset backoff on success
-            attempts = 0;
-            backoff = cfg_.backoff_initial_ms;
-            connected_.store(true);
-            width_ = cam.width();
-            height_ = cam.height();
-            fps_ = cam.fps();
-            logf("INFO", "Camera connected: %s %dx%d @%dfps", cfg_.camera_device.c_str(), width_, height_, fps_);
-
-            while (!stop_requested_.load() && !g_shutdown.load()) {
-                std::vector<uint8_t> frame;
-                int rc = cam.captureFrame(frame, cfg_.capture_timeout_ms);
-                if (rc == 1) {
-                    {
-                        std::lock_guard<std::mutex> lk(frame_mtx_);
-                        latest_frame_.swap(frame);
-                        last_update_ = std::chrono::steady_clock::now();
-                        frame_seq_++;
-                    }
-                    frame_cv_.notify_all();
-                } else if (rc == 0) {
-                    // timeout; keep looping
-                    continue;
-                } else {
-                    logf("ERROR", "Capture error; attempting reconnect.");
-                    break; // will reconnect
-                }
+            if (!stopFlag) {
+                log(LogLevel::WARN, "Capture loop ended unexpectedly; retry in " + std::to_string(backoffMs) + " ms");
+                sleepMs(backoffMs);
+                backoffMs = std::min(backoffMs * 2, retryMaxMs);
             }
-
-            cam.stopStreaming();
-            cam.closeDevice();
-            connected_.store(false);
-            logf("WARN", "Camera disconnected");
-            // Exponential backoff before reconnect
-            sleep_ms(backoff);
-            backoff = std::min(cfg_.backoff_max_ms, backoff * 2);
         }
-        logf("INFO", "Camera thread exit");
+        log(LogLevel::INFO, "UVCDevice worker exiting");
     }
 
-    static void sleep_ms(int ms) {
+    bool openAndConfigure() {
+        cleanup();
+        fd = ::open(devPath.c_str(), O_RDWR | O_NONBLOCK, 0);
+        if (fd < 0) {
+            log(LogLevel::ERROR, "Cannot open device: " + devPath + ", errno=" + std::to_string(errno));
+            return false;
+        }
+
+        v4l2_capability cap{};
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+            log(LogLevel::ERROR, "VIDIOC_QUERYCAP failed, errno=" + std::to_string(errno));
+            ::close(fd); fd = -1; return false;
+        }
+        if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+            log(LogLevel::ERROR, "Device does not support video capture");
+            ::close(fd); fd = -1; return false;
+        }
+        if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+            log(LogLevel::ERROR, "Device does not support streaming I/O");
+            ::close(fd); fd = -1; return false;
+        }
+
+        v4l2_format fmt{};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.fmt.pix.width = width;
+        fmt.fmt.pix.height = height;
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG; // Require MJPEG to avoid software encoding
+        fmt.fmt.pix.field = V4L2_FIELD_ANY;
+        if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+            log(LogLevel::ERROR, "VIDIOC_S_FMT (MJPEG) failed. Ensure your camera supports MJPEG. errno=" + std::to_string(errno));
+            ::close(fd); fd = -1; return false;
+        }
+        std::stringstream ss; ss << "Format set: " << fmt.fmt.pix.width << "x" << fmt.fmt.pix.height;
+        log(LogLevel::INFO, ss.str());
+
+        v4l2_streamparm parm{};
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        parm.parm.capture.timeperframe.numerator = 1;
+        parm.parm.capture.timeperframe.denominator = fps;
+        if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+            log(LogLevel::WARN, "VIDIOC_S_PARM failed; FPS might not be set. errno=" + std::to_string(errno));
+        } else {
+            int denom = parm.parm.capture.timeperframe.denominator;
+            int numer = parm.parm.capture.timeperframe.numerator;
+            if (denom > 0 && numer > 0) {
+                std::stringstream fpss; fpss << "FPS set to approx " << (double)denom / (double)numer;
+                log(LogLevel::INFO, fpss.str());
+            }
+        }
+
+        v4l2_requestbuffers req{};
+        req.count = 4;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+            log(LogLevel::ERROR, "VIDIOC_REQBUFS failed, errno=" + std::to_string(errno));
+            ::close(fd); fd = -1; return false;
+        }
+        if (req.count < 2) {
+            log(LogLevel::ERROR, "Insufficient buffer memory on device");
+            ::close(fd); fd = -1; return false;
+        }
+
+        buffers.resize(req.count);
+        for (unsigned int i = 0; i < req.count; ++i) {
+            v4l2_buffer buf{};
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = i;
+            if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+                log(LogLevel::ERROR, "VIDIOC_QUERYBUF failed, errno=" + std::to_string(errno));
+                ::close(fd); fd = -1; return false;
+            }
+
+            void *start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+            if (start == MAP_FAILED) {
+                log(LogLevel::ERROR, "mmap failed, errno=" + std::to_string(errno));
+                ::close(fd); fd = -1; return false;
+            }
+            buffers[i].start = start;
+            buffers[i].length = buf.length;
+        }
+
+        for (unsigned int i = 0; i < req.count; ++i) {
+            v4l2_buffer buf{};
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = i;
+            if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+                log(LogLevel::ERROR, "VIDIOC_QBUF failed, errno=" + std::to_string(errno));
+                ::close(fd); fd = -1; return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool streamOn() {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+            return false;
+        }
+        return true;
+    }
+
+    void streamOff() {
+        if (fd >= 0) {
+            int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            ioctl(fd, VIDIOC_STREAMOFF, &type);
+        }
+    }
+
+    void captureLoop() {
+        auto lastLog = std::chrono::steady_clock::now();
+        while (!stopFlag) {
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(fd, &fds);
+            struct timeval tv{};
+            tv.tv_sec = readTimeoutMs / 1000;
+            tv.tv_usec = (readTimeoutMs % 1000) * 1000;
+            int r = select(fd + 1, &fds, NULL, NULL, &tv);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                log(LogLevel::ERROR, std::string("select error: ") + std::strerror(errno));
+                break; // error -> restart
+            } else if (r == 0) {
+                log(LogLevel::DEBUG, "Frame read timeout");
+                continue;
+            }
+
+            v4l2_buffer buf{};
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                log(LogLevel::ERROR, std::string("VIDIOC_DQBUF error: ") + std::strerror(errno));
+                break; // error -> restart
+            }
+
+            if (buf.index >= buffers.size()) {
+                log(LogLevel::ERROR, "Buffer index out of range");
+                break;
+            }
+
+            // Copy MJPEG frame
+            {
+                std::lock_guard<std::mutex> lk(frameMutex);
+                latestFrame.assign((uint8_t*)buffers[buf.index].start, (uint8_t*)buffers[buf.index].start + buf.bytesused);
+                frameSeq++;
+                lastUpdateStr = nowString();
+            }
+            frameCond.notify_all();
+
+            // Log last-update timestamps periodically
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastLog >= std::chrono::seconds(1)) {
+                log(LogLevel::DEBUG, std::string("Last frame timestamp: ") + lastUpdateStr + ", size=" + std::to_string(latestFrame.size()));
+                lastLog = now;
+            }
+
+            if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+                log(LogLevel::ERROR, std::string("VIDIOC_QBUF error: ") + std::strerror(errno));
+                break;
+            }
+        }
+        log(LogLevel::WARN, "Ending capture loop");
+    }
+
+    void cleanup() {
+        if (fd >= 0) {
+            // unmap buffers
+            for (auto &b : buffers) {
+                if (b.start && b.length) {
+                    munmap(b.start, b.length);
+                }
+            }
+            buffers.clear();
+            ::close(fd);
+            fd = -1;
+        }
+    }
+
+    static void sleepMs(int ms) {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     }
 };
 
-// ========================= HTTP Server =========================
-static bool send_all(int fd, const void* data, size_t len) {
-    const char* p = (const char*)data;
-    while (len > 0) {
-        ssize_t n = ::send(fd, p, len, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        p += n;
-        len -= (size_t)n;
-    }
-    return true;
-}
-
-static bool recv_until(int fd, std::string& out, const std::string& delim, size_t max_bytes = 64 * 1024) {
-    out.clear();
-    char buf[1024];
-    while (out.find(delim) == std::string::npos) {
-        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        out.append(buf, buf + n);
-        if (out.size() > max_bytes) return false;
-    }
-    return true;
-}
-
+// -------------------- HTTP Server --------------------
 class HttpServer {
 public:
-    HttpServer(const Config& cfg, CameraManager& cam) : cfg_(cfg), cam_(cam) {}
+    HttpServer(const Config &cfg, UVCDevice &dev) : cfg(cfg), device(dev) {}
+    ~HttpServer() { stop(); }
 
     bool start() {
-        struct addrinfo hints; memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags = AI_PASSIVE;
-
-        std::string port_str = std::to_string(cfg_.http_port);
-        struct addrinfo* res = nullptr;
-        int r = getaddrinfo(cfg_.http_host.c_str(), port_str.c_str(), &hints, &res);
-        if (r != 0) {
-            logf("ERROR", "getaddrinfo: %s", gai_strerror(r));
+        serverSock = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (serverSock < 0) {
+            log(LogLevel::ERROR, "Failed to create socket: " + std::string(std::strerror(errno)));
             return false;
         }
-        int sfd = -1;
-        for (auto p = res; p != nullptr; p = p->ai_next) {
-            sfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (sfd < 0) continue;
-            int yes = 1;
-            setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-            if (bind(sfd, p->ai_addr, p->ai_addrlen) == 0) {
-                if (listen(sfd, 16) == 0) {
-                    listen_fd_ = sfd;
-                    freeaddrinfo(res);
-                    logf("INFO", "HTTP server listening on %s:%u", cfg_.http_host.c_str(), cfg_.http_port);
-                    accept_thread_ = std::thread(&HttpServer::acceptLoop, this);
-                    return true;
-                }
-            }
-            ::close(sfd);
+        int opt = 1;
+        setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(cfg.http_port);
+        if (inet_pton(AF_INET, cfg.http_host.c_str(), &addr.sin_addr) != 1) {
+            log(LogLevel::ERROR, "Invalid HTTP_HOST address: " + cfg.http_host);
+            ::close(serverSock);
+            serverSock = -1;
+            return false;
         }
-        freeaddrinfo(res);
-        logf("ERROR", "Failed to bind/listen on %s:%u", cfg_.http_host.c_str(), cfg_.http_port);
-        return false;
+        if (bind(serverSock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            log(LogLevel::ERROR, std::string("bind failed: ") + std::strerror(errno));
+            ::close(serverSock);
+            serverSock = -1;
+            return false;
+        }
+        if (listen(serverSock, 16) < 0) {
+            log(LogLevel::ERROR, std::string("listen failed: ") + std::strerror(errno));
+            ::close(serverSock);
+            serverSock = -1;
+            return false;
+        }
+        running = true;
+        acceptThread = std::thread(&HttpServer::acceptLoop, this);
+        log(LogLevel::INFO, "HTTP server listening on " + cfg.http_host + ":" + std::to_string(cfg.http_port));
+        return true;
     }
 
     void stop() {
-        stopping_.store(true);
-        if (listen_fd_ >= 0) {
-            ::shutdown(listen_fd_, SHUT_RDWR);
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        running = false;
+        if (serverSock >= 0) {
+            ::shutdown(serverSock, SHUT_RDWR);
+            ::close(serverSock);
+            serverSock = -1;
         }
-        if (accept_thread_.joinable()) accept_thread_.join();
-        // Join client threads
-        for (auto& t : client_threads_) {
-            if (t.joinable()) t.join();
-        }
-        client_threads_.clear();
-        logf("INFO", "HTTP server stopped");
+        if (acceptThread.joinable()) acceptThread.join();
     }
 
 private:
-    Config cfg_;
-    CameraManager& cam_;
-    int listen_fd_ = -1;
-    std::atomic<bool> stopping_{false};
-    std::thread accept_thread_;
-    std::vector<std::thread> client_threads_;
+    Config cfg;
+    UVCDevice &device;
+    int serverSock = -1;
+    std::atomic<bool> running{false};
+    std::thread acceptThread;
+
+    static bool recvLine(int sock, std::string &line) {
+        line.clear();
+        char c;
+        while (true) {
+            ssize_t n = recv(sock, &c, 1, 0);
+            if (n <= 0) return false;
+            if (c == '\r') {
+                // expect '\n'
+                n = recv(sock, &c, 1, 0);
+                if (n <= 0) return false;
+                if (c == '\n') break;
+            } else if (c == '\n') {
+                break;
+            } else {
+                line.push_back(c);
+            }
+        }
+        return true;
+    }
+
+    static bool sendAll(int sock, const void *data, size_t len) {
+        const uint8_t *p = (const uint8_t *)data;
+        size_t sent = 0;
+        while (sent < len) {
+            ssize_t n = send(sock, p + sent, len - sent, 0);
+            if (n <= 0) return false;
+            sent += (size_t)n;
+        }
+        return true;
+    }
 
     void acceptLoop() {
-        while (!stopping_.load() && !g_shutdown.load()) {
-            struct sockaddr_storage addr; socklen_t addrlen = sizeof(addr);
-            int cfd = accept(listen_fd_, (struct sockaddr*)&addr, &addrlen);
-            if (cfd < 0) {
+        while (running) {
+            sockaddr_in caddr{};
+            socklen_t clen = sizeof(caddr);
+            int csock = accept(serverSock, (sockaddr*)&caddr, &clen);
+            if (csock < 0) {
                 if (errno == EINTR) continue;
-                if (stopping_.load() || g_shutdown.load()) break;
-                logf("WARN", "accept failed: %s", strerror(errno));
+                if (!running) break;
+                log(LogLevel::WARN, std::string("accept failed: ") + std::strerror(errno));
                 continue;
             }
-            client_threads_.emplace_back(&HttpServer::handleClient, this, cfd);
+            std::thread(&HttpServer::handleClient, this, csock).detach();
         }
-        logf("INFO", "Accept loop exit");
     }
 
-    void handleClient(int cfd) {
-        // Read request headers
-        std::string raw;
-        if (!recv_until(cfd, raw, "\r\n\r\n")) {
-            ::close(cfd);
-            return;
-        }
-        // Parse request line
-        std::istringstream ss(raw);
-        std::string line;
-        std::getline(ss, line);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+    void handleClient(int csock) {
+        // Parse HTTP request
+        std::string requestLine;
+        if (!recvLine(csock, requestLine)) { ::close(csock); return; }
+        log(LogLevel::DEBUG, "Request: " + requestLine);
+
         std::string method, path, version;
         {
-            std::istringstream ls(line);
-            ls >> method >> path >> version;
+            std::istringstream iss(requestLine);
+            iss >> method >> path >> version;
         }
-        // Simple routing
+        // Read and discard headers
+        std::string headerLine;
+        while (recvLine(csock, headerLine)) {
+            if (headerLine.empty()) break;
+        }
+
         if (method == "POST" && path == "/connect") {
-            handleConnect(cfd);
+            handleConnect(csock);
         } else if (method == "GET" && path == "/stream") {
-            handleStream(cfd);
+            handleStream(csock);
         } else {
             std::string body = "{\"error\":\"not_found\"}";
-            std::ostringstream hdr;
-            hdr << "HTTP/1.1 404 Not Found\r\n";
-            hdr << "Content-Type: application/json\r\n";
-            hdr << "Content-Length: " << body.size() << "\r\n";
-            hdr << "Connection: close\r\n\r\n";
-            send_all(cfd, hdr.str().c_str(), hdr.str().size());
-            send_all(cfd, body.c_str(), body.size());
-            ::close(cfd);
+            std::ostringstream oss;
+            oss << "HTTP/1.1 404 Not Found\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n\r\n"
+                << body;
+            std::string resp = oss.str();
+            sendAll(csock, resp.data(), resp.size());
+            ::close(csock);
         }
     }
 
-    void handleConnect(int cfd) {
-        cam_.start();
-        // Wait briefly to see if it becomes connected
-        int wait_ms = 1000;
-        auto start = std::chrono::steady_clock::now();
-        while (!cam_.isConnected() && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(wait_ms)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        std::ostringstream body;
-        if (cam_.isConnected()) {
-            body << "{\"status\":\"connected\",\"device\":\"" << cam_.devicePath() << "\",";
-            body << "\"width\":" << cam_.width() << ",\"height\":" << cam_.height() << ",\"fps\":" << cam_.fps() << "}";
-        } else {
-            body << "{\"status\":\"connecting\",\"device\":\"" << cam_.devicePath() << "\"}";
-        }
-        std::string body_str = body.str();
-        std::ostringstream hdr;
-        hdr << "HTTP/1.1 200 OK\r\n";
-        hdr << "Content-Type: application/json\r\n";
-        hdr << "Content-Length: " << body_str.size() << "\r\n";
-        hdr << "Connection: close\r\n\r\n";
-        send_all(cfd, hdr.str().c_str(), hdr.str().size());
-        send_all(cfd, body_str.c_str(), body_str.size());
-        ::close(cfd);
-        logf("INFO", "POST /connect responded: %s", body_str.c_str());
+    void handleConnect(int csock) {
+        device.start();
+        std::string body = std::string("{\"status\":\"ok\",\"message\":\"camera initialized\",\"device\":\"") + cfg.uvc_device + "\",\"width\":" + std::to_string(cfg.uvc_width) + ",\"height\":" + std::to_string(cfg.uvc_height) + ",\"fps\":" + std::to_string(cfg.uvc_fps) + "}";
+        std::ostringstream oss;
+        oss << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << body;
+        std::string resp = oss.str();
+        sendAll(csock, resp.data(), resp.size());
+        ::close(csock);
     }
 
-    void handleStream(int cfd) {
-        if (!cam_.isConnected()) {
-            std::string body = "{\"error\":\"device_not_connected\"}";
-            std::ostringstream hdr;
-            hdr << "HTTP/1.1 503 Service Unavailable\r\n";
-            hdr << "Content-Type: application/json\r\n";
-            hdr << "Content-Length: " << body.size() << "\r\n";
-            hdr << "Connection: close\r\n\r\n";
-            send_all(cfd, hdr.str().c_str(), hdr.str().size());
-            send_all(cfd, body.c_str(), body.size());
-            ::close(cfd);
+    void handleStream(int csock) {
+        if (!device.isWorkerStarted()) {
+            std::string body = "{\"error\":\"not_connected\",\"message\":\"call /connect first\"}";
+            std::ostringstream oss;
+            oss << "HTTP/1.1 409 Conflict\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n\r\n"
+                << body;
+            std::string resp = oss.str();
+            sendAll(csock, resp.data(), resp.size());
+            ::close(csock);
             return;
         }
+
         std::ostringstream hdr;
-        hdr << "HTTP/1.1 200 OK\r\n";
-        hdr << "Cache-Control: no-cache, no-store, must-revalidate\r\n";
-        hdr << "Pragma: no-cache\r\n";
-        hdr << "Expires: 0\r\n";
-        hdr << "Connection: close\r\n";
-        hdr << "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-        if (!send_all(cfd, hdr.str().c_str(), hdr.str().size())) {
-            ::close(cfd);
-            return;
-        }
-        logf("INFO", "Client started GET /stream");
-        uint64_t last_seq = 0;
-        while (!g_shutdown.load()) {
+        hdr << "HTTP/1.1 200 OK\r\n"
+            << "Cache-Control: no-cache\r\n"
+            << "Pragma: no-cache\r\n"
+            << "Connection: close\r\n"
+            << "Content-Type: multipart/x-mixed-replace; boundary=" << cfg.stream_boundary << "\r\n\r\n";
+        std::string header = hdr.str();
+        if (!sendAll(csock, header.data(), header.size())) { ::close(csock); return; }
+
+        uint64_t lastSeq = 0;
+        while (true) {
             std::vector<uint8_t> frame;
-            uint64_t seq; std::chrono::steady_clock::time_point ts;
-            bool got = cam_.waitForNewFrame(last_seq, frame, seq, ts, 1000);
-            if (!got) {
-                // If not updated in timeout, try to send last known frame (if any)
-                if (last_seq == 0) continue; // no frame yet
-                // else continue waiting
-                continue;
-            }
-            last_seq = seq;
-            // Format timestamp
-            auto now_sys = std::chrono::system_clock::now() + (ts - std::chrono::steady_clock::now());
-            auto t = std::chrono::system_clock::to_time_t(now_sys);
-            auto tm = *std::localtime(&t);
-            char tsbuf[64];
-            strftime(tsbuf, sizeof(tsbuf), "%Y-%m-%d %H:%M:%S", &tm);
-            // Build part headers
-            std::ostringstream part;
-            part << "--frame\r\n";
-            part << "Content-Type: image/jpeg\r\n";
-            part << "Content-Length: " << frame.size() << "\r\n";
-            part << "X-Frame-Seq: " << seq << "\r\n";
-            part << "X-Timestamp: " << tsbuf << "\r\n\r\n";
-            if (!send_all(cfd, part.str().c_str(), part.str().size())) break;
-            if (!send_all(cfd, frame.data(), frame.size())) break;
-            static const char* crlf = "\r\n";
-            if (!send_all(cfd, crlf, 2)) break;
+            uint64_t newSeq = 0;
+            if (!device.waitForFrame(lastSeq, frame, newSeq)) break; // stop requested
+            lastSeq = newSeq;
+            if (frame.empty()) continue;
+
+            std::ostringstream partHdr;
+            partHdr << "--" << cfg.stream_boundary << "\r\n"
+                    << "Content-Type: image/jpeg\r\n"
+                    << "Content-Length: " << frame.size() << "\r\n\r\n";
+            std::string ph = partHdr.str();
+            if (!sendAll(csock, ph.data(), ph.size())) break;
+            if (!sendAll(csock, frame.data(), frame.size())) break;
+            const char *crlf = "\r\n";
+            if (!sendAll(csock, crlf, 2)) break;
         }
-        ::close(cfd);
-        logf("INFO", "Client closed GET /stream");
+        ::close(csock);
+        log(LogLevel::INFO, "Stream client disconnected");
     }
 };
 
-// ========================= Signal Handling =========================
-static void on_signal(int signo) {
-    (void)signo;
-    g_shutdown.store(true);
+// -------------------- Signal handling --------------------
+static std::atomic<bool> MAIN_RUNNING{true};
+
+static void sigHandler(int) {
+    MAIN_RUNNING = false;
 }
 
-// ========================= Main =========================
+// -------------------- Main --------------------
 int main() {
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-
-    Config cfg = load_config();
-    logf("INFO", "Starting USB camera HTTP driver");
-    logf("INFO", "HTTP_HOST=%s HTTP_PORT=%u", cfg.http_host.c_str(), cfg.http_port);
-    logf("INFO", "CAMERA_DEVICE=%s WIDTH=%d HEIGHT=%d FPS=%d", cfg.camera_device.c_str(), cfg.camera_width, cfg.camera_height, cfg.camera_fps);
-
-    CameraManager cam(cfg);
-    HttpServer server(cfg, cam);
-    if (!server.start()) {
-        logf("ERROR", "Failed to start HTTP server");
+    Config cfg;
+    if (!Config::loadFromEnv(cfg)) {
+        std::cerr << "Missing or invalid environment variables. See README.md for required configuration." << std::endl;
         return 1;
     }
 
-    // Run until shutdown
-    while (!g_shutdown.load()) {
+    // Set log level
+    if (cfg.log_level == "TRACE") GLOBAL_LOG_LEVEL = LogLevel::TRACE;
+    else if (cfg.log_level == "DEBUG") GLOBAL_LOG_LEVEL = LogLevel::DEBUG;
+    else if (cfg.log_level == "INFO") GLOBAL_LOG_LEVEL = LogLevel::INFO;
+    else if (cfg.log_level == "WARN") GLOBAL_LOG_LEVEL = LogLevel::WARN;
+    else GLOBAL_LOG_LEVEL = LogLevel::ERROR;
+
+    std::signal(SIGINT, sigHandler);
+    std::signal(SIGTERM, sigHandler);
+
+    UVCDevice dev(cfg);
+    HttpServer server(cfg, dev);
+    if (!server.start()) {
+        return 1;
+    }
+
+    // Main loop waits for signal
+    while (MAIN_RUNNING) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    logf("INFO", "Shutting down...");
+    log(LogLevel::INFO, "Shutting down...");
     server.stop();
-    cam.stop();
-    logf("INFO", "Exited cleanly");
+    dev.stop();
+    log(LogLevel::INFO, "Shutdown complete");
     return 0;
 }
